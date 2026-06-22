@@ -1,0 +1,14 @@
+%% Ready for SED 
+[atoms, mData] = read_pos_vel_and_data(); % Data Extract
+%lattice = generateLattice(atoms, mData, [4, 10]); % Labeling Process
+
+%lattice = generateLattice2(atoms, mData, perUC, bulkChains);
+lattice = generateLattice2(atoms, mData, 2,2); % Labeling Process
+%% Calulation
+[SEDmeta,freq_THz, q_reduced, SED_x, SED_y, SED_z, SED_total] = compute_SED(atoms, mData, lattice, ...
+    'time_step_fs', 10, ...
+    'num_splits', 1, ...
+    'q_points', 200);
+
+%% plot                  
+plot_SED(SED_x, SED_y, SED_z, freq_THz, q_reduced);
