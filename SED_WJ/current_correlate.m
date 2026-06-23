@@ -151,16 +151,16 @@ function plot_CC(CL, CT, omega_THz, q_reduced)
 
     figure('Color','w','Position',[100 100 1200 500]);
 
-    subplot(1,2,1);
+    ax1 = subplot(1,2,1);
     imagesc(q_plt, omega_THz, log(max(CL(:,qi), 0) + 1e-30));
     set(gca,'YDir','normal'); axis tight; ylim([0 1]);
-    colormap(hot); colorbar;
+    colormap(ax1, 'turbo'); colorbar;
     xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L (longitudinal)');
 
-    subplot(1,2,2);
+    ax2 = subplot(1,2,2);
     imagesc(q_plt, omega_THz, log(max(CT(:,qi), 0) + 1e-30));
     set(gca,'YDir','normal'); axis tight; ylim([0 1]);
-    colormap(hot); colorbar;
+    colormap(ax2, 'parula'); colorbar;
     xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_T (transverse)');
 
     saveName = fullfile(fileparts(mfilename('fullpath')), ...
@@ -212,7 +212,7 @@ function out = read_combined_dump(filename, maxSteps)
             step = step + 1;
             if maxSteps > 0 && step > maxSteps, break; end
             data = textscan(fid, '%f %f %f %f %f %f %f %f', nAtoms);
-            pos_cells{step} = [data{1}, data{3}, data{4}, data{5}];
+            pos_cells{step} = [data{2}, data{3}, data{4}, data{5}];   % col1=type, not id
             vel_cells{step} = [data{1}, data{6}, data{7}, data{8}];
             if mod(step, 50) == 0
                 fprintf('  frame %d  (%.0fs elapsed)\n', step, toc(t0));
