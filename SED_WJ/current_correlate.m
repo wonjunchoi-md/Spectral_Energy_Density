@@ -48,6 +48,8 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     num_q   = size(q_cart, 1);
     N_atoms = size(atoms.vel, 1);
 
+    if ~isfield(cfg, 'windowSize'), cfg.windowSize = floor(Nt/5); end
+    if ~isfield(cfg, 'windowStep'), cfg.windowStep = floor(cfg.windowSize/2); end
     ws    = cfg.windowSize;
     wstep = cfg.windowStep;
     N_tc  = ws + 1;   % lag τ = 0, 1, ..., ws
@@ -150,13 +152,13 @@ function plot_CC(CL, CT, omega_THz, q_reduced)
     figure('Color','w','Position',[100 100 1200 500]);
 
     subplot(1,2,1);
-    imagesc(q_plt, omega_THz, log(CL(:,qi) + 1e-30));
+    imagesc(q_plt, omega_THz, log(max(CL(:,qi), 0) + 1e-30));
     set(gca,'YDir','normal'); axis tight; ylim([0 1]);
     colormap(hot); colorbar;
     xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L (longitudinal)');
 
     subplot(1,2,2);
-    imagesc(q_plt, omega_THz, log(CT(:,qi) + 1e-30));
+    imagesc(q_plt, omega_THz, log(max(CT(:,qi), 0) + 1e-30));
     set(gca,'YDir','normal'); axis tight; ylim([0 1]);
     colormap(hot); colorbar;
     xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_T (transverse)');
