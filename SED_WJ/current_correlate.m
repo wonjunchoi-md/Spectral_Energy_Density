@@ -13,8 +13,6 @@
 %  [3] Wiener-Khinchin: PSD = dt · Re[ FFT[ mirror(ACF) ] ]
 %
 %  [4] Per-atom 정규화: / N_atoms
-%
-%  메모리 절감: trajectory → matfile (디스크), 윈도우 프레임만 RAM 로드
 % ================================================================
 
 %% ===== Config ===================================================
@@ -27,14 +25,14 @@ cfg.windowStep = 250;              % 윈도우 stride (50% overlap)
 
 %% ===== Pipeline =================================================
 
-[mf, mData, folderPath] = read_trajectory(cfg.folderPath, cfg.maxSteps);
+[atoms, mData, folderPath] = read_trajectory(cfg.folderPath, cfg.maxSteps);
 prim      = read_prim_xyz(fullfile(folderPath, cfg.primFile));
-ref       = build_reference(prim, mData);
+ref       = build_reference(prim, mData, atoms);
 
 q_reduced = (0 : floor(ref.N_UC/2)) / ref.N_UC;
 q_cart    = make_q_path(ref, q_reduced);
 
-[omega_THz, CL, CT] = compute_current_correlate(mf, q_cart, cfg);
+[omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg);
 plot_CC(CL, CT, omega_THz, q_reduced);
 
 
@@ -42,101 +40,112 @@ plot_CC(CL, CT, omega_THz, q_reduced);
 %  Local Functions
 %% ================================================================
 
-function [omega_THz, CL, CT] = compute_current_correlate(mf, q_cart, cfg)
-% C_L(q,ω), C_T(q,ω) — 윈도우별 즉석 계산 (jL/jT 전체 미리 저장 안 함)
+function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
+% C_L(q,ω), C_T(q,ω)  —  dynasor 방식 (ACF → FFT, per-atom, partial)
 
-    Nt      = mf.nSteps;
-    N_atoms = mf.nAtoms;
-    dt      = cfg.timeStepFs * 1e-15;
+    Nt      = size(atoms.vel, 3);
+    dt      = cfg.timeStepFs * 1e-15;   % [s]
     num_q   = size(q_cart, 1);
+    N_atoms = size(atoms.vel, 1);
 
     if ~isfield(cfg, 'windowSize'), cfg.windowSize = floor(Nt/5); end
     if ~isfield(cfg, 'windowStep'), cfg.windowStep = floor(cfg.windowSize/2); end
     ws    = cfg.windowSize;
     wstep = cfg.windowStep;
-    N_tc  = ws + 1;
+    N_tc  = ws + 1;   % lag τ = 0, 1, ..., ws
 
     q_mag = sqrt(sum(q_cart.^2, 2));
-    q_hat = q_cart ./ (q_mag + eps);
+    q_hat = q_cart ./ (q_mag + eps);   % [Nq × 3]
 
-    % 타입 목록은 첫 프레임에서만 로드
-    type_list  = round(mf.pos(:, 1, 1));
+    % ── 원자 타입 분류 ──────────────────────────────────────────
+    type_list  = round(atoms.pos(:, 1, 1));
     atom_types = unique(type_list);
     n_types    = numel(atom_types);
 
+    % ── [1] Step 1: 타입별 j_L, j_T 사전 계산 ─────────────────
+    % jL{s}: [Nq × Nt]  complex
+    % jT{s}: [Nq × 3 × Nt]  complex
+    fprintf('[CC] Pre-computing j by type: %d types × %d frames ...\n', n_types, Nt);
+    jL = cell(n_types, 1);
+    jT = cell(n_types, 1);
+    for s = 1:n_types
+        jL{s} = zeros(num_q, Nt, 'like', complex(0));
+        jT{s} = zeros(num_q, 3, Nt, 'like', complex(0));
+    end
+
+    t_pre = tic;
+    for it = 1:Nt
+        r = atoms.pos(:, 2:4, it);
+        v = atoms.vel(:, 2:4, it);
+        for s = 1:n_types
+            idx   = type_list == atom_types(s);
+            phase = exp(1i * (r(idx,:) * q_cart'));   % [Ns × Nq]
+            j_s   = phase' * v(idx,:);                % [Nq × 3]
+            jL_s  = sum(j_s .* q_hat, 2);             % [Nq × 1]
+            jL{s}(:, it)    = jL_s;
+            jT{s}(:, :, it) = j_s - jL_s .* q_hat;
+        end
+        if mod(it, 1000) == 0
+            fprintf('  pre-compute %d/%d  (%.0fs)\n', it, Nt, toc(t_pre));
+        end
+    end
+    fprintf('[CC] Pre-compute done in %.0fs.\n', toc(t_pre));
+
+    % ── [2] Step 2: 윈도우 기반 ACF 누적 ──────────────────────
     starts    = 1 : wstep : (Nt - ws);
     n_windows = numel(starts);
     CL_acf    = zeros(num_q, N_tc);
     CT_acf    = zeros(num_q, N_tc);
 
-    fprintf('[CC] %d windows × %d lags × %d q-pts ...\n', n_windows, N_tc, num_q);
+    fprintf('[CC] ACF: %d windows × %d lags × %d q-pts ...\n', n_windows, N_tc, num_q);
     t_acf = tic;
 
     for wi = 1:n_windows
         t0 = starts(wi);
-        t1 = t0 + ws;
-
-        % 이 윈도우 프레임만 디스크에서 로드
-        pos_win = mf.pos(:, :, t0:t1);   % [N_atoms × 4 × (ws+1)]
-        vel_win = mf.vel(:, :, t0:t1);
-
-        % jL/jT 이 윈도우에서만 계산
-        jL = zeros(num_q, ws+1, n_types, 'like', complex(0));
-        jT = zeros(num_q, 3, ws+1, n_types, 'like', complex(0));
-        for li = 1:ws+1
-            r = pos_win(:, 2:4, li);
-            v = vel_win(:, 2:4, li);
-            for s = 1:n_types
-                idx   = type_list == atom_types(s);
-                phase = exp(1i * (r(idx,:) * q_cart'));
-                j_s   = phase' * v(idx,:);
-                jL_s  = sum(j_s .* q_hat, 2);
-                jL(:, li, s)    = jL_s;
-                jT(:, :, li, s) = j_s - jL_s .* q_hat;
-            end
-        end
-
-        % ACF 누적
         for tau = 0:ws
+            t_tau = t0 + tau;
             for s1 = 1:n_types
                 for s2 = s1:n_types
-                    dCL = real(jL(:,1,s1) .* conj(jL(:,tau+1,s2)));
-                    dCT = 0.5 * real(sum(jT(:,:,1,s1) .* conj(jT(:,:,tau+1,s2)), 2));
-                    if s1 ~= s2
-                        dCL = dCL + real(jL(:,1,s2) .* conj(jL(:,tau+1,s1)));
-                        dCT = dCT + 0.5*real(sum(jT(:,:,1,s2) .* conj(jT(:,:,tau+1,s1)), 2));
+                    dCL = real(jL{s1}(:, t0) .* conj(jL{s2}(:, t_tau)));
+                    dCT = 0.5 * real(sum(jT{s1}(:,:,t0) .* conj(jT{s2}(:,:,t_tau)), 2));
+                    if s1 ~= s2   % (s2,s1) 대칭항 추가
+                        dCL = dCL + real(jL{s2}(:, t0) .* conj(jL{s1}(:, t_tau)));
+                        dCT = dCT + 0.5 * real(sum(jT{s2}(:,:,t0) .* conj(jT{s1}(:,:,t_tau)), 2));
                     end
                     CL_acf(:, tau+1) = CL_acf(:, tau+1) + dCL;
                     CT_acf(:, tau+1) = CT_acf(:, tau+1) + dCT;
                 end
             end
         end
-
         if mod(wi, max(1, floor(n_windows/10))) == 0
             fprintf('  window %d/%d  (%.0fs)\n', wi, n_windows, toc(t_acf));
         end
     end
 
+    % ── [3][4] Per-atom 정규화 + 윈도우 평균 ───────────────────
     CL_acf = CL_acf / (n_windows * N_atoms);
     CT_acf = CT_acf / (n_windows * N_atoms);
 
-    CL_mir = [CL_acf, CL_acf(:, end:-1:2)];
+    % ── Wiener-Khinchin: mirror ACF → FFT → real ───────────────
+    % ACF는 짝함수: mirror [C(0)..C(ws), C(ws-1)..C(1)] → 길이 2ws+1
+    CL_mir = [CL_acf, CL_acf(:, end:-1:2)];   % [Nq × (2ws+1)]
     CT_mir = [CT_acf, CT_acf(:, end:-1:2)];
     N_fft  = 2*ws + 1;
-    n_pos  = ws + 1;
+    n_pos  = ws + 1;   % rfft 양수 주파수 수 = floor(N_fft/2)+1
 
-    CL_psd = real(fft(CL_mir, [], 2)) * dt;
+    CL_psd = real(fft(CL_mir, [], 2)) * dt;   % [Nq × N_fft]
     CT_psd = real(fft(CT_mir, [], 2)) * dt;
 
-    CL = CL_psd(:, 1:n_pos)';
+    CL = CL_psd(:, 1:n_pos)';   % [N_pos × Nq]
     CT = CT_psd(:, 1:n_pos)';
 
-    omega_THz = (0 : n_pos-1) / (N_fft * dt) / 1e12;
+    omega_THz = (0 : n_pos-1) / (N_fft * dt) / 1e12;   % 선형 주파수 [THz]
     fprintf('[CC] Done in %.0fs.\n', toc(t_acf));
 end
 
 
 function plot_CC(CL, CT, omega_THz, q_reduced)
+    % omega_THz 는 이미 양수 주파수만 포함 (0 ~ Nyquist)
     qi    = q_reduced <= 0.5 + 1e-12;
     q_plt = 2 * q_reduced(qi);
 
@@ -161,7 +170,9 @@ function plot_CC(CL, CT, omega_THz, q_reduced)
 end
 
 
-function [mf, mData, folderPath] = read_trajectory(folderPath, maxSteps)
+% ── 아래는 main.m 과 동일한 헬퍼 함수들 ──────────────────────────
+
+function [atoms, mData, folderPath] = read_trajectory(folderPath, maxSteps)
     if isempty(folderPath)
         folderPath = uigetdir(pwd, 'Select data folder');
         if isequal(folderPath, 0), folderPath = pwd; end
@@ -174,78 +185,47 @@ function [mf, mData, folderPath] = read_trajectory(folderPath, maxSteps)
     dataFiles = dir(fullfile(folderPath, '*.data'));
     if isempty(dataFiles), dataFiles = dir(fullfile(folderPath, 'data.*')); end
 
-    dumpPath = fullfile(folderPath, dumpFiles(1).name);
-    matPath  = fullfile(folderPath, 'trajectory_cache.mat');
+    fprintf('Reading %s ...\n', dumpFiles(1).name);
+    out = read_combined_dump(fullfile(folderPath, dumpFiles(1).name), maxSteps);
+    atoms.pos = out.pos; atoms.vel = out.vel;
+    atoms.numAtoms = out.nAtoms; atoms.numSteps = out.nSteps;
 
-    if exist(matPath, 'file')
-        fprintf('Using cached trajectory: %s\n', matPath);
-        mf = matfile(matPath, 'Writable', false);
-    else
-        mf = stream_dump_to_matfile(dumpPath, matPath, maxSteps);
-    end
-
-    mData = parse_box_from_dump(dumpPath);
+    mData = parse_box_from_dump(fullfile(folderPath, dumpFiles(1).name));
     if ~isempty(dataFiles)
         tmp = parse_data_file(fullfile(folderPath, dataFiles(1).name));
         mData.masses = tmp.masses;
     end
-    fprintf('Trajectory: %d atoms × %d steps\n', mf.nAtoms, mf.nSteps);
+    fprintf('Loaded: %d atoms × %d steps\n', atoms.numAtoms, atoms.numSteps);
 end
 
-
-function mf = stream_dump_to_matfile(dumpPath, matPath, maxSteps)
-% dump 파일을 프레임별로 스트리밍 → matfile 저장 (RAM에 프레임 하나만 올라옴)
-
-    % Pass 1: nAtoms, nSteps 파악 (데이터 파싱 없이 헤더만 스캔)
-    fprintf('[Stream] Scanning %s ...\n', dumpPath);
-    fid = fopen(dumpPath, 'r');
-    nAtoms = 0; nSteps = 0;
+function out = read_combined_dump(filename, maxSteps)
+    if nargin < 2, maxSteps = 0; end
+    fid = fopen(filename, 'r');
+    if fid < 0, error('Cannot open %s', filename); end
+    pos_cells = {}; vel_cells = {}; nAtoms = 0; step = 0;
+    t0 = tic;
     while ~feof(fid)
-        line = fgetl(fid);
-        if ~ischar(line), continue; end
-        line = strtrim(line);
-        if contains(line, 'NUMBER OF ATOMS') && nAtoms == 0
-            nAtoms = str2double(strtrim(fgetl(fid)));
-        elseif contains(line, 'ITEM: TIMESTEP')
-            nSteps = nSteps + 1;
-            if maxSteps > 0 && nSteps >= maxSteps, break; end
-        end
-    end
-    fclose(fid);
-    if maxSteps > 0, nSteps = min(nSteps, maxSteps); end
-    fprintf('[Stream] %d atoms × %d frames\n', nAtoms, nSteps);
-
-    % matfile 사전 할당 (디스크에 공간 예약)
-    fprintf('[Stream] Preallocating %s ...\n', matPath);
-    mf = matfile(matPath, 'Writable', true);
-    mf.nAtoms = nAtoms;
-    mf.nSteps = nSteps;
-    mf.pos    = zeros(nAtoms, 4, nSteps);   % [type x y z]
-    mf.vel    = zeros(nAtoms, 4, nSteps);   % [type vx vy vz]
-
-    % Pass 2: 프레임별 스트리밍 저장
-    fprintf('[Stream] Writing frames ...\n');
-    fid = fopen(dumpPath, 'r');
-    step = 0; t0 = tic;
-    while ~feof(fid)
-        line = fgetl(fid);
-        if ~ischar(line), continue; end
-        if contains(strtrim(line), 'ITEM: ATOMS')
+        line = strtrim(fgetl(fid));
+        if contains(line, 'NUMBER OF ATOMS')
+            nAtoms = str2double(fgetl(fid));
+        elseif contains(line, 'ITEM: ATOMS')
             step = step + 1;
             if maxSteps > 0 && step > maxSteps, break; end
             data = textscan(fid, '%f %f %f %f %f %f %f %f', nAtoms);
-            mf.pos(:, :, step) = [data{2}, data{3}, data{4}, data{5}];
-            mf.vel(:, :, step) = [data{2}, data{6}, data{7}, data{8}];
+            pos_cells{step} = [data{2}, data{3}, data{4}, data{5}];   % [type x y z]
+            vel_cells{step} = [data{2}, data{6}, data{7}, data{8}];   % [type vx vy vz]
             if mod(step, 50) == 0
-                fprintf('  frame %d/%d  (%.0fs)\n', step, nSteps, toc(t0));
+                fprintf('  frame %d  (%.0fs elapsed)\n', step, toc(t0));
             end
         end
     end
     fclose(fid);
-    fprintf('[Stream] Done in %.0fs → %s\n', toc(t0), matPath);
-    mf = matfile(matPath, 'Writable', false);
+    fprintf('  total %d frames read in %.0fs\n', step, toc(t0));
+    nSteps = numel(pos_cells);
+    pos = zeros(nAtoms, 4, nSteps); vel = zeros(nAtoms, 4, nSteps);
+    for s = 1:nSteps, pos(:,:,s) = pos_cells{s}; vel(:,:,s) = vel_cells{s}; end
+    out.pos = pos; out.vel = vel; out.nAtoms = nAtoms; out.nSteps = nSteps;
 end
-
 
 function mData = parse_box_from_dump(filename)
     mData = struct('Lx',NaN,'Ly',NaN,'Lz',NaN,'masses',[],'chainDir','z');
@@ -297,7 +277,8 @@ function prim = read_prim_xyz(xyzFile)
     prim.cell_diag = [cell_mat(1,1) cell_mat(2,2) cell_mat(3,3)];
 end
 
-function ref = build_reference(prim, mData)
+function ref = build_reference(prim, mData, atoms)
+    atomsPerUC = prim.n_atoms;
     L = [mData.Lx mData.Ly mData.Lz];
     dim_rough = max(1, round(L ./ prim.cell_diag));
     [~, imin] = min(dim_rough);
