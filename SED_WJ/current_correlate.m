@@ -1,12 +1,18 @@
 %% ================================================================
 %  Current Correlation Function — C_L(q,ω), C_T(q,ω)
+%  dynasor 방식: ACF → FFT (Wiener-Khinchin)
 %
-%  j(q,t)   = Σ_i exp(iq·r_i(t)) · v_i(t)   [actual positions]
-%  j_L(q,t) = j · q̂                           [longitudinal]
-%  j_T(q,t) = j - j_L·q̂                       [transverse]
+%  [1] 타입별 partial current
+%      j_s(q,t) = Σ_{i∈s} exp(iq·r_i(t)) · v_i(t)
+%      j_L_s    = j_s · q̂           (종파)
+%      j_T_s    = j_s − j_L_s · q̂  (횡파)
 %
-%  C_L(q,ω) = |FFT[j_L(q,t)]|² / (N · dt)
-%  C_T(q,ω) = 0.5 · Σ_α |FFT[j_T_α(q,t)]|² / (N · dt)
+%  [2] ACF (윈도우 평균)
+%      C_L(q,τ) = (1/N) Σ_{s1,s2} Re[ j_L_s1(q,t)·j*_L_s2(q,t+τ) ]_t
+%
+%  [3] Wiener-Khinchin: PSD = dt · Re[ FFT[ mirror(ACF) ] ]
+%
+%  [4] Per-atom 정규화: / N_atoms
 % ================================================================
 
 %% ===== Config ===================================================
@@ -14,94 +20,143 @@ cfg.folderPath = '';               % 비워두면 GUI 폴더 선택창
 cfg.primFile   = 'prim_no_H.xyz';  % 선택한 폴더 안에 있어야 함
 cfg.timeStepFs = 40;
 cfg.maxSteps   = 0;
+cfg.windowSize = 500;              % ACF 최대 time lag (# frames)
+cfg.windowStep = 250;              % 윈도우 stride (50% overlap)
 
 %% ===== Pipeline =================================================
 
 [atoms, mData, folderPath] = read_trajectory(cfg.folderPath, cfg.maxSteps);
-prim           = read_prim_xyz(fullfile(folderPath, cfg.primFile));
-ref            = build_reference(prim, mData, atoms);
+prim      = read_prim_xyz(fullfile(folderPath, cfg.primFile));
+ref       = build_reference(prim, mData, atoms);
 
-% BvK q-points (동일한 방식)
 q_reduced = (0 : floor(ref.N_UC/2)) / ref.N_UC;
 q_cart    = make_q_path(ref, q_reduced);
 
-[freq_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg);
-plot_CC(CL, CT, freq_THz, q_reduced);
+[omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg);
+plot_CC(CL, CT, omega_THz, q_reduced);
 
 
 %% ================================================================
 %  Local Functions
 %% ================================================================
 
-function [freq_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
-% C_L(q,ω), C_T(q,ω) via FFT of current j(q,t)
+function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
+% C_L(q,ω), C_T(q,ω)  —  dynasor 방식 (ACF → FFT, per-atom, partial)
 
-    Nt   = size(atoms.vel, 3);
-    dt   = cfg.timeStepFs * 1e-15;
-    num_q = size(q_cart, 1);
+    Nt      = size(atoms.vel, 3);
+    dt      = cfg.timeStepFs * 1e-15;   % [s]
+    num_q   = size(q_cart, 1);
+    N_atoms = size(atoms.vel, 1);
 
-    % q̂ (단위벡터) [Nq × 3]
+    ws    = cfg.windowSize;
+    wstep = cfg.windowStep;
+    N_tc  = ws + 1;   % lag τ = 0, 1, ..., ws
+
     q_mag = sqrt(sum(q_cart.^2, 2));
-    q_hat = q_cart ./ (q_mag + eps);
+    q_hat = q_cart ./ (q_mag + eps);   % [Nq × 3]
 
-    fprintf('[CC] %d q-pts × %d steps ...\n', num_q, Nt);
-    t0 = tic;
+    % ── 원자 타입 분류 ──────────────────────────────────────────
+    type_list  = round(atoms.pos(:, 1, 1));
+    atom_types = unique(type_list);
+    n_types    = numel(atom_types);
 
-    % j_L, j_T 시계열 누적 [Nq × Nt]
-    jL = zeros(num_q, Nt);           % complex
-    jT = zeros(num_q, 3, Nt);        % complex
+    % ── [1] Step 1: 타입별 j_L, j_T 사전 계산 ─────────────────
+    % jL{s}: [Nq × Nt]  complex
+    % jT{s}: [Nq × 3 × Nt]  complex
+    fprintf('[CC] Pre-computing j by type: %d types × %d frames ...\n', n_types, Nt);
+    jL = cell(n_types, 1);
+    jT = cell(n_types, 1);
+    for s = 1:n_types
+        jL{s} = zeros(num_q, Nt, 'like', complex(0));
+        jT{s} = zeros(num_q, 3, Nt, 'like', complex(0));
+    end
 
+    t_pre = tic;
     for it = 1:Nt
-        r     = atoms.pos(:, 2:4, it);        % [N × 3]  실제 위치
-        v     = atoms.vel(:, 2:4, it);        % [N × 3]
-        phase = exp(1i * (r * q_cart'));       % [N × Nq]
-        j     = phase' * v;                    % [Nq × 3]
-
-        jL_t       = sum(j .* q_hat, 2);      % [Nq × 1]
-        jL(:,it)   = jL_t;
-        jT(:,:,it) = j - jL_t .* q_hat;       % [Nq × 3]
-
+        r = atoms.pos(:, 2:4, it);
+        v = atoms.vel(:, 2:4, it);
+        for s = 1:n_types
+            idx   = type_list == atom_types(s);
+            phase = exp(1i * (r(idx,:) * q_cart'));   % [Ns × Nq]
+            j_s   = phase' * v(idx,:);                % [Nq × 3]
+            jL_s  = sum(j_s .* q_hat, 2);             % [Nq × 1]
+            jL{s}(:, it)    = jL_s;
+            jT{s}(:, :, it) = j_s - jL_s .* q_hat;
+        end
         if mod(it, 1000) == 0
-            fprintf('  step %d/%d  (%.0fs)\n', it, Nt, toc(t0));
+            fprintf('  pre-compute %d/%d  (%.0fs)\n', it, Nt, toc(t_pre));
+        end
+    end
+    fprintf('[CC] Pre-compute done in %.0fs.\n', toc(t_pre));
+
+    % ── [2] Step 2: 윈도우 기반 ACF 누적 ──────────────────────
+    starts    = 1 : wstep : (Nt - ws);
+    n_windows = numel(starts);
+    CL_acf    = zeros(num_q, N_tc);
+    CT_acf    = zeros(num_q, N_tc);
+
+    fprintf('[CC] ACF: %d windows × %d lags × %d q-pts ...\n', n_windows, N_tc, num_q);
+    t_acf = tic;
+
+    for wi = 1:n_windows
+        t0 = starts(wi);
+        for tau = 0:ws
+            t_tau = t0 + tau;
+            for s1 = 1:n_types
+                for s2 = s1:n_types
+                    dCL = real(jL{s1}(:, t0) .* conj(jL{s2}(:, t_tau)));
+                    dCT = 0.5 * real(sum(jT{s1}(:,:,t0) .* conj(jT{s2}(:,:,t_tau)), 2));
+                    if s1 ~= s2   % (s2,s1) 대칭항 추가
+                        dCL = dCL + real(jL{s2}(:, t0) .* conj(jL{s1}(:, t_tau)));
+                        dCT = dCT + 0.5 * real(sum(jT{s2}(:,:,t0) .* conj(jT{s1}(:,:,t_tau)), 2));
+                    end
+                    CL_acf(:, tau+1) = CL_acf(:, tau+1) + dCL;
+                    CT_acf(:, tau+1) = CT_acf(:, tau+1) + dCT;
+                end
+            end
+        end
+        if mod(wi, max(1, floor(n_windows/10))) == 0
+            fprintf('  window %d/%d  (%.0fs)\n', wi, n_windows, toc(t_acf));
         end
     end
 
-    % FFT → PSD
-    norm  = Nt * dt;
-    CL    = zeros(Nt, num_q);
-    CT    = zeros(Nt, num_q);
+    % ── [3][4] Per-atom 정규화 + 윈도우 평균 ───────────────────
+    CL_acf = CL_acf / (n_windows * N_atoms);
+    CT_acf = CT_acf / (n_windows * N_atoms);
 
-    for iq = 1:num_q
-        FL        = fftshift(fft(jL(iq,:)));
-        CL(:,iq)  = abs(FL).^2 / norm;
+    % ── Wiener-Khinchin: mirror ACF → FFT → real ───────────────
+    % ACF는 짝함수: mirror [C(0)..C(ws), C(ws-1)..C(1)] → 길이 2ws+1
+    CL_mir = [CL_acf, CL_acf(:, end:-1:2)];   % [Nq × (2ws+1)]
+    CT_mir = [CT_acf, CT_acf(:, end:-1:2)];
+    N_fft  = 2*ws + 1;
+    n_pos  = ws + 1;   % rfft 양수 주파수 수 = floor(N_fft/2)+1
 
-        FTx = fftshift(fft(squeeze(jT(iq,1,:))'));
-        FTy = fftshift(fft(squeeze(jT(iq,2,:))'));
-        FTz = fftshift(fft(squeeze(jT(iq,3,:))'));
-        CT(:,iq)  = 0.5 * (abs(FTx).^2 + abs(FTy).^2 + abs(FTz).^2) / norm;
-    end
+    CL_psd = real(fft(CL_mir, [], 2)) * dt;   % [Nq × N_fft]
+    CT_psd = real(fft(CT_mir, [], 2)) * dt;
 
-    freq_THz = linspace(-0.5/dt, 0.5/dt, Nt) / 1e12;
-    fprintf('[CC] Done in %.0fs.\n', toc(t0));
+    CL = CL_psd(:, 1:n_pos)';   % [N_pos × Nq]
+    CT = CT_psd(:, 1:n_pos)';
+
+    omega_THz = (0 : n_pos-1) / (N_fft * dt) / 1e12;   % 선형 주파수 [THz]
+    fprintf('[CC] Done in %.0fs.\n', toc(t_acf));
 end
 
 
-function plot_CC(CL, CT, freq_THz, q_reduced)
-    fi    = freq_THz >= 0;
+function plot_CC(CL, CT, omega_THz, q_reduced)
+    % omega_THz 는 이미 양수 주파수만 포함 (0 ~ Nyquist)
     qi    = q_reduced <= 0.5 + 1e-12;
-    freq  = freq_THz(fi);
     q_plt = 2 * q_reduced(qi);
 
     figure('Color','w','Position',[100 100 1200 500]);
 
     subplot(1,2,1);
-    imagesc(q_plt, freq, log(CL(fi,qi) + 1e-30));
+    imagesc(q_plt, omega_THz, log(CL(:,qi) + 1e-30));
     set(gca,'YDir','normal'); axis tight; ylim([0 1]);
     colormap(hot); colorbar;
     xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L (longitudinal)');
 
     subplot(1,2,2);
-    imagesc(q_plt, freq, log(CT(fi,qi) + 1e-30));
+    imagesc(q_plt, omega_THz, log(CT(:,qi) + 1e-30));
     set(gca,'YDir','normal'); axis tight; ylim([0 1]);
     colormap(hot); colorbar;
     xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_T (transverse)');
