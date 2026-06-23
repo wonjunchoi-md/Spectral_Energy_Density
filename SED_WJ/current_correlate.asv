@@ -2,7 +2,7 @@
 %  Current Correlation Function — C_L(q,ω), C_T(q,ω)
 %  dynasor 방식: ACF → FFT (Wiener-Khinchin)
 %
-%  [1] 타입별 partial currentc
+%  [1] 타입별 partial current
 %      j_s(q,t) = Σ_{i∈s} exp(iq·r_i(t)) · v_i(t)
 %      j_L_s    = j_s · q̂           (종파)
 %      j_T_s    = j_s − j_L_s · q̂  (횡파)
@@ -18,10 +18,10 @@
 %% ===== Config ===================================================
 cfg.folderPath = '';               % 비워두면 GUI 폴더 선택창
 cfg.primFile   = 'prim_no_H.xyz';  % 선택한 폴더 안에 있어야 함
-cfg.timeStepFs = 10;
-cfg.maxSteps   = 10000;
-cfg.windowSize = 10000;              % ACF 최대 time lag (# frames)
-cfg.windowStep = 10000;              % 윈도우 stride (50% overlap)
+cfg.timeStepFs = 40;
+cfg.maxSteps   = 0;
+cfg.windowSize = 2000;              % ACF 최대 time lag (# frames)
+cfg.windowStep = 2000;              % 윈도우 stride (50% overlap)
 
 %% ===== Pipeline =================================================
 
@@ -32,95 +32,12 @@ q_reduced = (0 : floor(ref.N_UC/2)) / ref.N_UC;
 q_cart    = make_q_path(ref, q_reduced);
 
 [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg);
-%% Plot
 plot_CC(CL, CT, omega_THz, q_reduced);
 
 
 %% ================================================================
 %  Local Functions
 %% ================================================================
-function plot_CC(CL, CT, omega_THz, q_reduced)
-    qi    = q_reduced <= 0.5 + 1e-12;
-    q_plt = 2 * q_reduced(qi);
-
-    % q 범위에 해당하는 데이터만 추출
-    CLi = CL(:, qi);
-    CTi = CT(:, qi);
-
-    % NaN, Inf 제거
-    CLi(~isfinite(CLi)) = 0;
-    CTi(~isfinite(CTi)) = 0;
-
-    % log scale 변환
-    ZL = log10(max(CLi, 1e-30));
-    ZT = log10(max(CTi, 1e-30));
-
-    % color limit 안전 계산
-    % [2 98]보다 더 자르고 싶으면 [5 95] 또는 [10 90] 사용
-    climL = safe_clim(ZL, [0.1 99.7]);
-    climT = safe_clim(ZT, [0.1 99.7]);
-
-    figure('Color','w','Position',[100 100 1200 500]);
-
-    base = hot(256);
-    cmap = base(80:end, :);   % remove black/dark part
-
-    ax1 = subplot(1,2,1);
-    imagesc(q_plt, omega_THz, ZL);
-    set(ax1, 'YDir', 'normal');
-    axis(ax1, 'tight');
-    ylim(ax1, [0 1]);
-    colormap(ax1, cmap);
-    colorbar(ax1);
-    caxis(ax1, climL);
-    xlabel(ax1, 'q (\pi/a)');
-    ylabel(ax1, 'Frequency (THz)');
-    title(ax1, 'C_L (longitudinal)');
-
-    ax2 = subplot(1,2,2);
-    imagesc(q_plt, omega_THz, ZT);
-    set(ax2, 'YDir', 'normal');
-    axis(ax2, 'tight');
-    ylim(ax2, [0 1]);
-    colormap(ax2, cmap);
-    colorbar(ax2);
-    caxis(ax2, climT);
-    xlabel(ax2, 'q (\pi/a)');
-    ylabel(ax2, 'Frequency (THz)');
-    title(ax2, 'C_T (transverse)');
-
-    saveName = fullfile(fileparts(mfilename('fullpath')), ...
-        sprintf('CC_%s.png', datestr(now,'yyyymmdd_HHMMSS')));
-
-    exportgraphics(gcf, saveName, 'Resolution', 200);
-    fprintf('Saved: %s\n', saveName);
-end
-
-
-function clim = safe_clim(Z, pct)
-    vals = Z(:);
-    vals = vals(isfinite(vals));
-
-    if isempty(vals)
-        clim = [-30 0];
-        return;
-    end
-
-    clim = prctile(vals, pct);
-
-    if ~all(isfinite(clim)) || clim(1) >= clim(2)
-        v = median(vals, 'omitnan');
-
-        if ~isfinite(v)
-            v = 0;
-        end
-
-        clim = [v - 1, v + 1];
-    end
-end
-
-
-
 
 function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
 % C_L(q,ω), C_T(q,ω)  —  dynasor 방식 (ACF → FFT, per-atom, partial)
@@ -226,6 +143,32 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
 
     omega_THz = (0 : n_pos-1) / (N_fft * dt) / 1e12;   % 선형 주파수 [THz]
     fprintf('[CC] Done in %.0fs.\n', toc(t_acf));
+end
+
+
+function plot_CC(CL, CT, omega_THz, q_reduced)
+    % omega_THz 는 이미 양수 주파수만 포함 (0 ~ Nyquist)
+    qi    = q_reduced <= 0.5 + 1e-12;
+    q_plt = 2 * q_reduced(qi);
+
+    figure('Color','w','Position',[100 100 1200 500]);
+
+    ax1 = subplot(1,2,1);
+    imagesc(q_plt, omega_THz, log(max(CL(:,qi), 0) + 1e-30));
+    set(gca,'YDir','normal'); axis tight; ylim([0 1]);
+    colormap(ax1, 'turbo'); colorbar;
+    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L (longitudinal)');
+
+    ax2 = subplot(1,2,2);
+    imagesc(q_plt, omega_THz, log(max(CT(:,qi), 0) + 1e-30));
+    set(gca,'YDir','normal'); axis tight; ylim([0 1]);
+    colormap(ax2, 'parula'); colorbar;
+    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_T (transverse)');
+
+    saveName = fullfile(fileparts(mfilename('fullpath')), ...
+        sprintf('CC_%s.png', datestr(now,'yyyymmdd_HHMMSS')));
+    exportgraphics(gcf, saveName, 'Resolution', 200);
+    fprintf('Saved: %s\n', saveName);
 end
 
 
