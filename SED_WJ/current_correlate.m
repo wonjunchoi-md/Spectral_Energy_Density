@@ -126,7 +126,7 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
 % C_L(q,ω), C_T(q,ω)  —  dynasor 방식 (ACF → FFT, per-atom, partial)
 
     Nt      = size(atoms.vel, 3);
-    dt      = cfg.timeStepFs * 1e-15;   % [s]
+    dt      = cfg.timeStepFs;            % [fs]  — dynasor 단위계 통일
     num_q   = size(q_cart, 1);
     N_atoms = size(atoms.vel, 1);
 
@@ -224,11 +224,66 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     CL = CL_psd(:, 1:n_pos)';   % [N_pos × Nq]
     CT = CT_psd(:, 1:n_pos)';
 
-    omega_THz = (0 : n_pos-1) / (N_fft * dt) / 1e12;   % 선형 주파수 [THz]
+    omega_THz = (0 : n_pos-1) / (N_fft * dt) * 1e3;    % 선형 주파수 [THz]  (dt [fs] → *1e3)
     fprintf('[CC] Done in %.0fs.\n', toc(t_acf));
 end
 
 
+<<<<<<< Updated upstream
+=======
+function plot_CC(CL, CT, omega_THz, q_reduced)
+    % omega_THz 는 이미 양수 주파수만 포함 (0 ~ Nyquist)
+    qi      = q_reduced <= 0.5 + 1e-12;
+    q_plt   = 2 * q_reduced(qi);
+    CL_qi   = CL(:, qi);
+    CT_qi   = CT(:, qi);
+    diff_qi = CL_qi - CT_qi;
+
+    freq_max  = max(omega_THz);
+
+    % 99th-percentile clipping (linear scale)
+    vmax_L    = prctile(CL_qi(:),       99);
+    vmax_T    = prctile(CT_qi(:),       99);
+    vlim_diff = prctile(abs(diff_qi(:)), 99);
+
+    % blue-white-red diverging colormap for C_L − C_T
+    n_cmap = 256; half = n_cmap / 2;
+    r = [linspace(0,1,half), ones(1,half)];
+    g = [linspace(0,1,half), linspace(1,0,half)];
+    b = [ones(1,half),       linspace(1,0,half)];
+    cmap_bwr = [r; g; b]';
+
+    figure('Color','w','Position',[100 100 1800 500]);
+
+    ax1 = subplot(1,3,1);
+    imagesc(q_plt, omega_THz, CL_qi);
+    set(gca,'YDir','normal'); axis tight; ylim([0 freq_max]);
+    caxis([0 vmax_L]);
+    colormap(ax1, 'turbo'); colorbar;
+    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L (longitudinal)');
+
+    ax2 = subplot(1,3,2);
+    imagesc(q_plt, omega_THz, CT_qi);
+    set(gca,'YDir','normal'); axis tight; ylim([0 freq_max]);
+    caxis([0 vmax_T]);
+    colormap(ax2, 'parula'); colorbar;
+    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_T (transverse)');
+
+    ax3 = subplot(1,3,3);
+    imagesc(q_plt, omega_THz, diff_qi);
+    set(gca,'YDir','normal'); axis tight; ylim([0 freq_max]);
+    caxis([-vlim_diff vlim_diff]);
+    colormap(ax3, cmap_bwr); colorbar;
+    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L − C_T');
+
+    saveName = fullfile(fileparts(mfilename('fullpath')), ...
+        sprintf('CC_%s.png', datestr(now,'yyyymmdd_HHMMSS')));
+    exportgraphics(gcf, saveName, 'Resolution', 200);
+    fprintf('Saved: %s\n', saveName);
+end
+
+
+>>>>>>> Stashed changes
 % ── 아래는 main.m 과 동일한 헬퍼 함수들 ──────────────────────────
 
 function [atoms, mData, folderPath] = read_trajectory(folderPath, maxSteps)
