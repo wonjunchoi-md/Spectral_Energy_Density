@@ -40,58 +40,61 @@ plot_CC(CL, CT, omega_THz, q_reduced);
 %  Local Functions
 %% ================================================================
 function plot_CC(CL, CT, omega_THz, q_reduced)
+    % dynasor 방식: linear scale + percentile clipping + 3 subplots
     qi    = q_reduced <= 0.5 + 1e-12;
     q_plt = 2 * q_reduced(qi);
 
-    % q 범위에 해당하는 데이터만 추출
-    CLi = CL(:, qi);
-    CTi = CT(:, qi);
-
-    % NaN, Inf 제거
+    CLi  = CL(:, qi);  CTi = CT(:, qi);
     CLi(~isfinite(CLi)) = 0;
     CTi(~isfinite(CTi)) = 0;
+    diff_i = CLi - CTi;   % C_L − C_T: 종파(+red) / 횡파(-blue)
 
-    % log scale 변환
-    ZL = log10(max(CLi, 1e-30));
-    ZT = log10(max(CTi, 1e-30));
+    freq_max = max(omega_THz);
 
-    % color limit 안전 계산
-    % [2 98]보다 더 자르고 싶으면 [5 95] 또는 [10 90] 사용
-    climL = safe_clim(ZL, [0.1 99.7]);
-    climT = safe_clim(ZT, [0.1 99.7]);
+    % 99th-percentile clipping — dynasor의 vmin/vmax 방식과 동일
+    climL  = safe_clim(CLi,            [0 99]);
+    climT  = safe_clim(CTi,            [0 99]);
+    vlim_d = prctile(abs(diff_i(:)), 99);
+    if ~isfinite(vlim_d) || vlim_d == 0, vlim_d = 1; end
 
-    figure('Color','w','Position',[100 100 1200 500]);
+    % blue-white-red diverging colormap (dynasor RdBu 대응)
+    nc = 256; h = nc/2;
+    r = [linspace(0,1,h), ones(1,h)];
+    g = [linspace(0,1,h), linspace(1,0,h)];
+    b = [ones(1,h),       linspace(1,0,h)];
+    cmap_bwr = [r; g; b]';
 
-    base = hot(256);
-    cmap = base(80:end, :);   % remove black/dark part
+    figure('Color','w','Position',[100 100 1800 500]);
 
-    ax1 = subplot(1,2,1);
-    imagesc(q_plt, omega_THz, ZL);
-    set(ax1, 'YDir', 'normal');
-    axis(ax1, 'tight');
-    ylim(ax1, [0 1]);
-    colormap(ax1, cmap);
-    colorbar(ax1);
+    ax1 = subplot(1,3,1);
+    imagesc(q_plt, omega_THz, CLi);
+    set(ax1,'YDir','normal'); axis(ax1,'tight');
+    ylim(ax1, [0 freq_max]);
     caxis(ax1, climL);
-    xlabel(ax1, 'q (\pi/a)');
-    ylabel(ax1, 'Frequency (THz)');
-    title(ax1, 'C_L (longitudinal)');
+    colormap(ax1, 'turbo'); colorbar(ax1);
+    xlabel(ax1,'q (\pi/a)'); ylabel(ax1,'Frequency (THz)');
+    title(ax1,'C_L (longitudinal)');
 
-    ax2 = subplot(1,2,2);
-    imagesc(q_plt, omega_THz, ZT);
-    set(ax2, 'YDir', 'normal');
-    axis(ax2, 'tight');
-    ylim(ax2, [0 1]);
-    colormap(ax2, cmap);
-    colorbar(ax2);
+    ax2 = subplot(1,3,2);
+    imagesc(q_plt, omega_THz, CTi);
+    set(ax2,'YDir','normal'); axis(ax2,'tight');
+    ylim(ax2, [0 freq_max]);
     caxis(ax2, climT);
-    xlabel(ax2, 'q (\pi/a)');
-    ylabel(ax2, 'Frequency (THz)');
-    title(ax2, 'C_T (transverse)');
+    colormap(ax2, 'parula'); colorbar(ax2);
+    xlabel(ax2,'q (\pi/a)'); ylabel(ax2,'Frequency (THz)');
+    title(ax2,'C_T (transverse)');
+
+    ax3 = subplot(1,3,3);
+    imagesc(q_plt, omega_THz, diff_i);
+    set(ax3,'YDir','normal'); axis(ax3,'tight');
+    ylim(ax3, [0 freq_max]);
+    caxis(ax3, [-vlim_d vlim_d]);
+    colormap(ax3, cmap_bwr); colorbar(ax3);
+    xlabel(ax3,'q (\pi/a)'); ylabel(ax3,'Frequency (THz)');
+    title(ax3,'C_L − C_T');
 
     saveName = fullfile(fileparts(mfilename('fullpath')), ...
         sprintf('CC_%s.png', datestr(now,'yyyymmdd_HHMMSS')));
-
     exportgraphics(gcf, saveName, 'Resolution', 200);
     fprintf('Saved: %s\n', saveName);
 end
@@ -100,22 +103,15 @@ end
 function clim = safe_clim(Z, pct)
     vals = Z(:);
     vals = vals(isfinite(vals));
-
     if isempty(vals)
-        clim = [-30 0];
+        clim = [0 1];
         return;
     end
-
     clim = prctile(vals, pct);
-
     if ~all(isfinite(clim)) || clim(1) >= clim(2)
-        v = median(vals, 'omitnan');
-
-        if ~isfinite(v)
-            v = 0;
-        end
-
-        clim = [v - 1, v + 1];
+        v = max(abs(vals));
+        if ~isfinite(v) || v == 0, v = 1; end
+        clim = [0, v];
     end
 end
 
