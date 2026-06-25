@@ -1,15 +1,18 @@
 %% ================================================================
-%  Current Correlation Function — C_L(q,ω), C_T(q,ω)
-%  dynasor 방식: ACF → Filon cosine transform
-% ================================================================
+% Current correlation: time-origin averaged ACF + Filon cosine transform
+%% ================================================================
 %% ===== Config ===================================================
-cfg.folderPath = '';                 % 비워두면 GUI 폴더 선택창
-cfg.primFile   = 'prim_no_H.xyz';    % 선택한 폴더 안에 있어야 함
+cfg.folderPath = '';
+cfg.primFile   = 'prim_no_H.xyz';
 cfg.timeStepFs = 40;
 cfg.maxSteps   = 0;
-cfg.windowSize = 12501;              % ACF 최대 time lag (# frames)
-cfg.windowStep = 12501;              % 윈도우 stride (50% overlap)
-cfg.plotClipPercentile = 99;      % plot color clipping percentile
+cfg.windowSize = 12500;
+cfg.windowStep = 12500;
+cfg.plotClipPercentile = 98;      % 3-panel plot upper color clipping percentile
+cfg.saveDynasorStylePlot = true;
+cfg.dynasorLogMin = 0;            % 0 = use full log-intensity minimum
+cfg.dynasorLogMax = 0;            % 0 = use full log-intensity maximum
+cfg.outputRoot = 'CC_outputs';
 
 %% ===== Pipeline =================================================
 
@@ -18,17 +21,104 @@ prim      = read_prim_xyz(fullfile(folderPath, cfg.primFile));
 ref       = build_reference(prim, mData, atoms);
 q_reduced = (0 : floor(ref.N_UC/2)) / ref.N_UC;
 q_cart    = make_q_path(ref, q_reduced);
+cfg       = prepare_output_dir(cfg);
 
 [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg);
+save_current_result(CL, CT, omega_THz, q_reduced, q_cart, cfg, ref, mData, folderPath);
+write_replot_script(cfg.outputDir);
 %% Plot
 plot_CC(CL, CT, omega_THz, q_reduced, cfg);
 
 
 %% ================================================================
+function cfg = prepare_output_dir(cfg)
+    sourceDir = fileparts(mfilename('fullpath'));
+    if isempty(sourceDir), sourceDir = pwd; end
+    cfg.sourceDir = sourceDir;
+
+    if ~isfield(cfg, 'outputRoot') || isempty(cfg.outputRoot)
+        cfg.outputRoot = fullfile(sourceDir, 'CC_outputs');
+    elseif ~is_absolute_path(cfg.outputRoot)
+        cfg.outputRoot = fullfile(sourceDir, cfg.outputRoot);
+    end
+
+    if ~isfield(cfg, 'runTag') || isempty(cfg.runTag)
+        cfg.runTag = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+    end
+
+    if ~isfield(cfg, 'outputDir') || isempty(cfg.outputDir)
+        cfg.outputDir = fullfile(cfg.outputRoot, ['CC_' cfg.runTag]);
+    end
+
+    if ~exist(cfg.outputDir, 'dir')
+        mkdir(cfg.outputDir);
+    end
+    fprintf('Output folder: %s\n', cfg.outputDir);
+end
+
+function tf = is_absolute_path(pathText)
+    pathText = char(pathText);
+    tf = startsWith(pathText, filesep) || ~isempty(regexp(pathText, '^[A-Za-z]:[\\/]', 'once'));
+end
+
+function outDir = get_output_dir(cfg)
+    if nargin >= 1 && isfield(cfg, 'outputDir') && ~isempty(cfg.outputDir)
+        outDir = cfg.outputDir;
+    else
+        outDir = fileparts(mfilename('fullpath'));
+        if isempty(outDir), outDir = pwd; end
+    end
+    if ~exist(outDir, 'dir')
+        mkdir(outDir);
+    end
+end
+
+function save_current_result(CL, CT, omega_THz, q_reduced, q_cart, cfg, ref, mData, folderPath)
+    outDir = get_output_dir(cfg);
+    dataFile = fullfile(outDir, 'CC_data.mat');
+    save(dataFile, 'CL', 'CT', 'omega_THz', 'q_reduced', 'q_cart', ...
+        'cfg', 'ref', 'mData', 'folderPath', '-v7.3');
+    fprintf('Saved data: %s\n', dataFile);
+end
+
+function write_replot_script(outputDir)
+    plotFile = fullfile(outputDir, 'PLOT.m');
+    lines = {
+        '%% Replot saved current-correlation data without recomputing.'
+        'clear; close all;'
+        'thisDir = fileparts(mfilename(''fullpath''));'
+        'S = load(fullfile(thisDir, ''CC_data.mat''));'
+        'cfg = S.cfg;'
+        ''
+        '% 0 means use the actual full min/max of log(C_L + C_T).'
+        '% After the first plot, set these to values such as -7 and -2.'
+        'cfg.dynasorLogMin = 0;'
+        'cfg.dynasorLogMax = 0;'
+        ''
+        'if isfield(cfg, ''sourceDir'') && exist(cfg.sourceDir, ''dir'')'
+        '    addpath(cfg.sourceDir);'
+        'end'
+        ''
+        'plot_current_saved(S.CL, S.CT, S.omega_THz, S.q_reduced, cfg, thisDir, ''CC_dynasor_replot'');'
+        };
+
+    fid = fopen(plotFile, 'w');
+    if fid < 0
+        error('Cannot write %s', plotFile);
+    end
+    cleaner = onCleanup(@() fclose(fid));
+    for i = 1:numel(lines)
+        fprintf(fid, '%s\n', lines{i});
+    end
+    clear cleaner
+    fprintf('Saved replot script: %s\n', plotFile);
+end
+
+%% ================================================================
 function plot_CC(CL, CT, omega_THz, q_reduced, cfg)
     % Paper-style current intensity plots with a black-red-yellow-white map.
     if nargin < 5 || ~isfield(cfg, 'plotClipPercentile')
-        cfg.plotClipPercentile = 99.5;
+        cfg.plotClipPercentile = 90;
     end
     qi    = q_reduced <= 0.5 + 1e-12;
     q_plt = 2 * q_reduced(qi);
@@ -80,10 +170,20 @@ function plot_CC(CL, CT, omega_THz, q_reduced, cfg)
     cb.Label.String = 'C(q,\omega)';
     cb.Label.FontSize = 11;
 
-    saveName = fullfile(fileparts(mfilename('fullpath')), ...
+    outDir = get_output_dir(cfg);
+    saveName = fullfile(outDir, ...
         sprintf('CC_%s.png', char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'))));
     exportgraphics(gcf, saveName, 'Resolution', 200);
     fprintf('Saved: %s\n', saveName);
+
+    if isfield(cfg, 'saveDynasorStylePlot') && cfg.saveDynasorStylePlot
+        plot_CC_dynasor_style(CL, CT, omega_THz, q_reduced, cfg);
+    end
+end
+
+function plot_CC_dynasor_style(CL, CT, omega_THz, q_reduced, cfg)
+% Dynasor-like single heatmap: log intensity, inferno-like colormap.
+    plot_current_saved(CL, CT, omega_THz, q_reduced, cfg, get_output_dir(cfg), 'CC_dynasor');
 end
 
 function I = prepare_current_intensity(Z)
@@ -190,10 +290,9 @@ end
 
 
 function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
-% C_L(q,ω), C_T(q,ω)  —  dynasor 방식 (ACF → Filon, per-atom, partial)
 
     Nt      = size(atoms.vel, 3);
-    dt      = cfg.timeStepFs;            % [fs]  — dynasor 단위계 통일
+    dt      = cfg.timeStepFs;
     num_q   = size(q_cart, 1);
     N_atoms = size(atoms.vel, 1);
 
@@ -204,7 +303,7 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     if mod(ws, 2) ~= 0
         error('cfg.windowSize must be even to match dynasor fourier_cos_filon.');
     end
-    N_tc  = ws + 1;   % lag τ = 0, 1, ..., ws
+    N_tc  = ws + 1;
 
     q_mag = sqrt(sum(q_cart.^2, 2));
     q_hat = zeros(size(q_cart));
@@ -212,15 +311,11 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     nonzero_q = q_mag > 0;
     q_hat(nonzero_q,:) = q_cart(nonzero_q,:) ./ q_mag(nonzero_q);
 
-    % ── 원자 타입 분류 ──────────────────────────────────────────
     type_list  = round(atoms.pos(:, 1, 1));
     atom_types = unique(type_list);
     n_types    = numel(atom_types);
 
-    % ── [1] Step 1: 타입별 j_L, j_T 사전 계산 ─────────────────
-    % jL{s}: [Nq × Nt]  complex
-    % jT{s}: [Nq × 3 × Nt]  complex
-    fprintf('[CC] Pre-computing j by type: %d types × %d frames ...\n', n_types, Nt);
+    fprintf('[CC] Pre-computing j by type: %d types x %d frames ...\n', n_types, Nt);
     jL = cell(n_types, 1);
     jT = cell(n_types, 1);
     for s = 1:n_types
@@ -234,9 +329,9 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
         v = atoms.vel(:, 2:4, it);
         for s = 1:n_types
             idx   = type_list == atom_types(s);
-            phase = exp(1i * (r(idx,:) * q_cart'));   % [Ns × Nq]
-            j_s   = phase' * v(idx,:);                % [Nq × 3]
-            jL_s  = sum(j_s .* q_hat, 2);             % [Nq × 1]
+            phase = exp(1i * (r(idx,:) * q_cart'));   % [Ns x Nq]
+            j_s   = phase' * v(idx,:);                % [Nq x 3]
+            jL_s  = sum(j_s .* q_hat, 2);
             jL{s}(:, it)    = jL_s;
             jT{s}(:, :, it) = j_s - jL_s .* q_hat;
         end
@@ -246,41 +341,35 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     end
     fprintf('[CC] Pre-compute done in %.0fs.\n', toc(t_pre));
 
-    % ── [2] Step 2: 윈도우 기반 ACF 누적 ──────────────────────
     starts    = 1 : wstep : (Nt - ws);
     n_windows = numel(starts);
     if n_windows == 0
         error('No windows processed. Nt (%d) must be larger than cfg.windowSize (%d).', Nt, ws);
     end
-    CL_acf    = zeros(num_q, N_tc);
-    CT_acf    = zeros(num_q, N_tc);
 
-    fprintf('[CC] ACF: %d windows × %d lags × %d q-pts ...\n', n_windows, N_tc, num_q);
+    jL_total = zeros(num_q, Nt, 'like', complex(0));
+    jT_total = zeros(num_q, 3, Nt, 'like', complex(0));
+    for s = 1:n_types
+        jL_total = jL_total + jL{s};
+        jT_total = jT_total + jT{s};
+    end
+
+    CL_acf = zeros(num_q, N_tc);
+    CT_acf = zeros(num_q, N_tc);
+
+    fprintf('[CC] FFT-ACF: %d windows x %d lags x %d q-pts ...\n', n_windows, N_tc, num_q);
     t_acf = tic;
 
     for wi = 1:n_windows
-        t0 = starts(wi);
-        for tau = 0:ws
-            t_tau = t0 + tau;
-            for s1 = 1:n_types
-                for s2 = s1:n_types
-                    dCL = real(jL{s1}(:, t0) .* conj(jL{s2}(:, t_tau)));
-                    dCT = 0.5 * real(sum(jT{s1}(:,:,t0) .* conj(jT{s2}(:,:,t_tau)), 2));
-                    if s1 ~= s2   % (s2,s1) 대칭항 추가
-                        dCL = dCL + real(jL{s2}(:, t0) .* conj(jL{s1}(:, t_tau)));
-                        dCT = dCT + 0.5 * real(sum(jT{s2}(:,:,t0) .* conj(jT{s1}(:,:,t_tau)), 2));
-                    end
-                    CL_acf(:, tau+1) = CL_acf(:, tau+1) + dCL;
-                    CT_acf(:, tau+1) = CT_acf(:, tau+1) + dCT;
-                end
-            end
-        end
+        idx = starts(wi) : (starts(wi) + ws);
+        CL_acf = CL_acf + autocorr_fft_rows(jL_total(:, idx));
+        CT_acf = CT_acf + autocorr_fft_vec3(jT_total(:, :, idx));
+
         if mod(wi, max(1, floor(n_windows/10))) == 0
             fprintf('  window %d/%d  (%.0fs)\n', wi, n_windows, toc(t_acf));
         end
     end
 
-    % ── [3][4] Per-atom 정규화 + 윈도우 평균 ───────────────────
     CL_acf = CL_acf / (n_windows * N_atoms);
     CT_acf = CT_acf / (n_windows * N_atoms);
 
@@ -295,10 +384,34 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     fprintf('[CC] Done in %.0fs.\n', toc(t_acf));
 end
 
+function acf = autocorr_fft_rows(x)
+% Time-origin averaged autocorrelation for rows: <x(t) x*(t+tau)>_t.
+    [n_rows, n_time] = size(x);
+    nfft = 2^nextpow2(2*n_time - 1);
+    spec = fft(x, nfft, 2);
+    raw = ifft(abs(spec).^2, [], 2);
+    counts = n_time:-1:1;
+    acf = real(raw(:, 1:n_time)) ./ counts;
+    if size(acf, 1) ~= n_rows
+        error('autocorr_fft_rows: unexpected output shape.');
+    end
+end
+
+function acf = autocorr_fft_vec3(x)
+% Time-origin averaged vector autocorrelation for [Nq x 3 x time].
+    [n_q, ~, n_time] = size(x);
+    nfft = 2^nextpow2(2*n_time - 1);
+    spec = fft(x, nfft, 3);
+    raw = ifft(abs(spec).^2, [], 3);
+    counts = reshape(n_time:-1:1, 1, 1, n_time);
+    raw = real(raw(:, :, 1:n_time)) ./ counts;
+    acf = reshape(0.5 * sum(raw, 2), n_q, n_time);
+end
+
 function [omega, F] = fourier_cos_filon_matlab(f, dt)
 % MATLAB port of dynasor.post_processing.filon.fourier_cos_filon.
 % f is [Nq x Nt] with Nt = window_size + 1 and window_size even.
-    if ndims(f) ~= 2
+    if ~ismatrix(f)
         error('fourier_cos_filon_matlab: f must be a 2D array.');
     end
 
@@ -349,7 +462,6 @@ function [alpha, beta, gamma] = filon_alpha_beta_gamma(theta)
     gamma(nz) = 4 * (s - th .* c) ./ th.^3;
 end
 
-% ── 아래는 main.m 과 동일한 헬퍼 함수들 ──────────────────────────
 
 function [atoms, mData, folderPath] = read_trajectory(folderPath, maxSteps)
     if isempty(folderPath)
@@ -374,7 +486,7 @@ function [atoms, mData, folderPath] = read_trajectory(folderPath, maxSteps)
         tmp = parse_data_file(fullfile(folderPath, dataFiles(1).name));
         mData.masses = tmp.masses;
     end
-    fprintf('Loaded: %d atoms × %d steps\n', atoms.numAtoms, atoms.numSteps);
+    fprintf('Loaded: %d atoms x %d steps\n', atoms.numAtoms, atoms.numSteps);
 end
 
 function out = read_combined_dump(filename, maxSteps)
@@ -456,8 +568,7 @@ function prim = read_prim_xyz(xyzFile)
     prim.cell_diag = [cell_mat(1,1) cell_mat(2,2) cell_mat(3,3)];
 end
 
-function ref = build_reference(prim, mData, atoms)
-    atomsPerUC = prim.n_atoms;
+function ref = build_reference(prim, mData, ~)
     L = [mData.Lx mData.Ly mData.Lz];
     dim_rough = max(1, round(L ./ prim.cell_diag));
     [~, imin] = min(dim_rough);
