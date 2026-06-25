@@ -1,0 +1,148 @@
+S = load('CC_data.mat');
+
+CL = S.CL;
+CT = S.CT;
+omega_THz = S.omega_THz;
+q_reduced = S.q_reduced;
+
+qi = q_reduced <= 0.5 + 1e-12;
+q_plt = 2 * q_reduced(qi);
+
+Craw = CL(:, qi) + CT(:, qi);
+
+
+
+
+figure;
+
+subplot(1,2,1);
+imagesc(q_plt, omega_THz, CL);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('C_L(q,\omega)');
+
+subplot(1,2,2);
+imagesc(q_plt, omega_THz, CT);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('C_T(q,\omega)');
+%% Maximum Clamp : Zero...
+
+CL_zero = max(CL, 0);
+CT_zero = max(CT, 0);
+
+figure;
+
+subplot(1,2,1);
+imagesc(q_plt, omega_THz, CL_zero);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('C_L(q,\omega)');
+
+subplot(1,2,2);
+imagesc(q_plt, omega_THz, CT_zero);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('C_T(q,\omega)');
+%% 
+
+%% Data clamp
+
+CL_clamp = CL;
+CT_clamp = CT;
+
+clampMin = 0.01;
+clampMax = 0.4;
+
+CL_clamp(CL_clamp < clampMin) = clampMin;
+CL_clamp(CL_clamp > clampMax) = clampMax;
+
+CT_clamp(CT_clamp < clampMin) = clampMin;
+CT_clamp(CT_clamp > clampMax) = clampMax;
+
+CL_clamp(CL_clamp > 0 & CL_clamp < clampMin) = clampMin;
+CT_clamp(CT_clamp > 0 & CT_clamp < clampMin) = clampMin;
+
+figure;
+
+subplot(1,2,1);
+imagesc(q_plt, omega_THz, CL_clamp);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+clim([clampMin clampMax]);
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('C_L(q,\omega)');
+
+subplot(1,2,2);
+imagesc(q_plt, omega_THz, CT_clamp);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+clim([clampMin clampMax]);
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('C_T(q,\omega)');
+%% Intensity Scaling
+CL_zero = max(CL,0);
+CT_zero = max(CT,0);
+
+intensity_percentile = 99.85;
+
+CL_pval = prctile(CL_zero, intensity_percentile);
+CT_pval = prctile(CT_zero, intensity_percentile);
+
+
+CL_norm = CL_scaled / CL_pval;
+CT_norm = CT_scaled / CT_pval;
+
+
+CL_norm(CL_norm > 1) = 1;
+CT_norm(CT_norm > 1) = 1;
+
+CL_plot = log10(CL_norm * 9 + 1);
+CT_plot = log10(CT_norm * 9 + 1);
+
+
+figure;
+
+subplot(1,2,1);
+imagesc(q_plt, omega_THz, CL_plot);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+clim([0 1]);
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('Scaled C_L(q,\omega)');
+
+subplot(1,2,2);
+imagesc(q_plt, omega_THz, CT_plot);
+set(gca, 'YDir', 'normal');
+colormap(gca, inferno_colormap(256));
+colorbar;
+clim([0 1]);
+xlabel('q (\pi/a)');
+ylabel('Frequency (THz)');
+ylim([0 2]);
+title('Scaled C_T(q,\omega)');

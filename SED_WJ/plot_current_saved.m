@@ -41,6 +41,7 @@ function saveName = plot_current_saved(CL, CT, omega_THz, q_reduced, cfg, output
     pcolormesh_centers(ax, q_plt, omega_THz(:), Clog);
     set(ax, 'YDir', 'normal', 'Box', 'on', 'Layer', 'top', ...
         'FontSize', 13, 'LineWidth', 1.0, 'TickDir', 'in');
+    hide_axes_toolbar(ax);
     axis(ax, 'tight');
     xlim(ax, [min(q_plt) max(q_plt)]);
     ylim(ax, [0 max(omega_THz)]);
@@ -61,6 +62,15 @@ function saveName = plot_current_saved(CL, CT, omega_THz, q_reduced, cfg, output
     fprintf('Saved: %s\n', saveName);
     fprintf('log color range used: [%.6g, %.6g]\n', vmin, vmax);
     fprintf('auto full log range : [%.6g, %.6g]\n', autoMin, autoMax);
+end
+
+function hide_axes_toolbar(ax)
+    try
+        if isprop(ax, 'Toolbar') && ~isempty(ax.Toolbar)
+            ax.Toolbar.Visible = 'off';
+        end
+    catch
+    end
 end
 
 function [vmin, vmax] = resolve_log_limits(cfg, autoMin, autoMax)

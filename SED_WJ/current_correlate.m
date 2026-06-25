@@ -10,8 +10,8 @@ cfg.windowSize = 12500;
 cfg.windowStep = 12500;
 cfg.plotClipPercentile = 98;      % 3-panel plot upper color clipping percentile
 cfg.saveDynasorStylePlot = true;
-cfg.dynasorLogMin = 0;            % 0 = use full log-intensity minimum
-cfg.dynasorLogMax = 0;            % 0 = use full log-intensity maximum
+cfg.dynasorLogMin = -7;            % 0 = use full log-intensity minimum
+cfg.dynasorLogMax = 99.9;            % 0 = use full log-intensity maximum
 cfg.outputRoot = 'CC_outputs';
 
 %% ===== Pipeline =================================================
@@ -99,6 +99,7 @@ function write_replot_script(outputDir)
         '    addpath(cfg.sourceDir);'
         'end'
         ''
+        'plot_current_process(S.CL, S.CT, S.omega_THz, S.q_reduced, cfg, thisDir, ''CC_process'');'
         'plot_current_saved(S.CL, S.CT, S.omega_THz, S.q_reduced, cfg, thisDir, ''CC_dynasor_replot'');'
         };
 
