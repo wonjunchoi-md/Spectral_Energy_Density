@@ -1,27 +1,15 @@
 %% ================================================================
 %  Current Correlation Function — C_L(q,ω), C_T(q,ω)
-%  dynasor 방식: ACF → FFT (Wiener-Khinchin)
-%
-%  [1] 타입별 partial currentc
-%      j_s(q,t) = Σ_{i∈s} exp(iq·r_i(t)) · v_i(t)
-%      j_L_s    = j_s · q̂           (종파)
-%      j_T_s    = j_s − j_L_s · q̂  (횡파)
-%
-%  [2] ACF (윈도우 평균)
-%      C_L(q,τ) = (1/N) Σ_{s1,s2} Re[ j_L_s1(q,t)·j*_L_s2(q,t+τ) ]_t
-%
-%  [3] Wiener-Khinchin: PSD = dt · Re[ FFT[ mirror(ACF) ] ]
-%
-%  [4] Per-atom 정규화: / N_atoms
+%  dynasor 방식: ACF → Filon cosine transform
 % ================================================================
-
 %% ===== Config ===================================================
-cfg.folderPath = '';               % 비워두면 GUI 폴더 선택창
-cfg.primFile   = 'prim_no_H.xyz';  % 선택한 폴더 안에 있어야 함
-cfg.timeStepFs = 10;
-cfg.maxSteps   = 10000;
-cfg.windowSize = 10000;              % ACF 최대 time lag (# frames)
-cfg.windowStep = 10000;              % 윈도우 stride (50% overlap)
+cfg.folderPath = '';                 % 비워두면 GUI 폴더 선택창
+cfg.primFile   = 'prim_no_H.xyz';    % 선택한 폴더 안에 있어야 함
+cfg.timeStepFs = 40;
+cfg.maxSteps   = 0;
+cfg.windowSize = 12501;              % ACF 최대 time lag (# frames)
+cfg.windowStep = 12501;              % 윈도우 stride (50% overlap)
+cfg.plotClipPercentile = 99;      % plot color clipping percentile
 
 %% ===== Pipeline =================================================
 
@@ -33,93 +21,176 @@ q_cart    = make_q_path(ref, q_reduced);
 
 [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg);
 %% Plot
-plot_CC(CL, CT, omega_THz, q_reduced);
+plot_CC(CL, CT, omega_THz, q_reduced, cfg);
 
 
 %% ================================================================
-%  Local Functions
-%% ================================================================
-function plot_CC(CL, CT, omega_THz, q_reduced)
-    % dynasor 방식: linear scale + percentile clipping + 3 subplots
+function plot_CC(CL, CT, omega_THz, q_reduced, cfg)
+    % Paper-style current intensity plots with a black-red-yellow-white map.
+    if nargin < 5 || ~isfield(cfg, 'plotClipPercentile')
+        cfg.plotClipPercentile = 99.5;
+    end
     qi    = q_reduced <= 0.5 + 1e-12;
     q_plt = 2 * q_reduced(qi);
 
     CLi  = CL(:, qi);  CTi = CT(:, qi);
     CLi(~isfinite(CLi)) = 0;
     CTi(~isfinite(CTi)) = 0;
-    diff_i = CLi - CTi;   % C_L − C_T: 종파(+red) / 횡파(-blue)
-
     freq_max = max(omega_THz);
 
-    % 99th-percentile clipping — dynasor의 vmin/vmax 방식과 동일
-    climL  = safe_clim(CLi,            [0 99]);
-    climT  = safe_clim(CTi,            [0 99]);
-    vlim_d = prctile(abs(diff_i(:)), 99);
-    if ~isfinite(vlim_d) || vlim_d == 0, vlim_d = 1; end
+    CLp = prepare_current_intensity(CLi);
+    CTp = prepare_current_intensity(CTi);
+    Cp  = prepare_current_intensity(max(CLi, 0) + max(CTi, 0));
 
-    % blue-white-red diverging colormap (dynasor RdBu 대응)
-    nc = 256; h = nc/2;
-    r = [linspace(0,1,h), ones(1,h)];
-    g = [linspace(0,1,h), linspace(1,0,h)];
-    b = [ones(1,h),       linspace(1,0,h)];
-    cmap_bwr = [r; g; b]';
+    vals = [CLp(:); CTp(:); Cp(:)];
+    vals = vals(isfinite(vals) & vals > 0);
+    if isempty(vals)
+        clim_i = [0 1];
+    else
+        vmax = prctile(vals, cfg.plotClipPercentile);
+        if ~isfinite(vmax) || vmax <= 0, vmax = max(vals); end
+        if ~isfinite(vmax) || vmax <= 0, vmax = 1; end
+        clim_i = [0 vmax];
+    end
 
-    figure('Color','w','Position',[100 100 1800 500]);
+    fig = figure('Color','w','Position',[80 100 1320 430]);
+    tl = tiledlayout(fig, 1, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
 
-    ax1 = subplot(1,3,1);
-    imagesc(q_plt, omega_THz, CLi);
-    set(ax1,'YDir','normal'); axis(ax1,'tight');
-    ylim(ax1, [0 freq_max]);
-    caxis(ax1, climL);
-    colormap(ax1, 'turbo'); colorbar(ax1);
-    xlabel(ax1,'q (\pi/a)'); ylabel(ax1,'Frequency (THz)');
-    title(ax1,'C_L (longitudinal)');
+    ax1 = nexttile(tl, 1);
+    plot_current_panel(ax1, q_plt, omega_THz, CLp, clim_i, 'C_L');
+    ylabel(ax1, 'Frequency (THz)');
 
-    ax2 = subplot(1,3,2);
-    imagesc(q_plt, omega_THz, CTi);
-    set(ax2,'YDir','normal'); axis(ax2,'tight');
-    ylim(ax2, [0 freq_max]);
-    caxis(ax2, climT);
-    colormap(ax2, 'parula'); colorbar(ax2);
-    xlabel(ax2,'q (\pi/a)'); ylabel(ax2,'Frequency (THz)');
-    title(ax2,'C_T (transverse)');
+    ax2 = nexttile(tl, 2);
+    plot_current_panel(ax2, q_plt, omega_THz, CTp, clim_i, 'C_T');
+    ylabel(ax2, '');
+    ax2.YTickLabel = [];
 
-    ax3 = subplot(1,3,3);
-    imagesc(q_plt, omega_THz, diff_i);
-    set(ax3,'YDir','normal'); axis(ax3,'tight');
-    ylim(ax3, [0 freq_max]);
-    caxis(ax3, [-vlim_d vlim_d]);
-    colormap(ax3, cmap_bwr); colorbar(ax3);
-    xlabel(ax3,'q (\pi/a)'); ylabel(ax3,'Frequency (THz)');
-    title(ax3,'C_L − C_T');
+    ax3 = nexttile(tl, 3);
+    plot_current_panel(ax3, q_plt, omega_THz, Cp, clim_i, 'C_L + C_T');
+    ylabel(ax3, '');
+    ax3.YTickLabel = [];
+
+    set([ax1 ax2 ax3], 'YLim', [0 freq_max]);
+    cmap = paper_hot_colormap(256);
+    colormap(ax1, cmap);
+    colormap(ax2, cmap);
+    colormap(ax3, cmap);
+    cb = colorbar(ax3);
+    cb.Layout.Tile = 'east';
+    cb.Label.String = 'C(q,\omega)';
+    cb.Label.FontSize = 11;
 
     saveName = fullfile(fileparts(mfilename('fullpath')), ...
-        sprintf('CC_%s.png', datestr(now,'yyyymmdd_HHMMSS')));
+        sprintf('CC_%s.png', char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'))));
     exportgraphics(gcf, saveName, 'Resolution', 200);
     fprintf('Saved: %s\n', saveName);
 end
 
+function I = prepare_current_intensity(Z)
+% Plot-only cleanup: keep positive intensity, darken background, smooth speckle.
+    I = max(Z, 0);
+    I(~isfinite(I)) = 0;
+    vals0 = I(isfinite(I) & I > 0);
+    if ~isempty(vals0)
+        I = max(I - prctile(vals0, 35), 0);
+    end
+    I = smooth_heatmap(I, 0.9, 0.55);
+end
 
-function clim = safe_clim(Z, pct)
-    vals = Z(:);
-    vals = vals(isfinite(vals));
-    if isempty(vals)
-        clim = [0 1];
+function plot_current_panel(ax, q_plt, omega_THz, Z, clim_i, panel_title)
+    pcolormesh_centers(ax, q_plt, omega_THz, Z);
+    set(ax, 'YDir', 'normal', 'Box', 'on', 'Layer', 'top', ...
+        'FontSize', 12, 'LineWidth', 1.0, 'TickDir', 'in');
+    axis(ax, 'tight');
+    xlim(ax, [min(q_plt) max(q_plt)]);
+    xticks(ax, 0:0.2:1);
+    clim(ax, clim_i);
+    xlabel(ax, 'q (\pi/a)');
+    title(ax, panel_title);
+end
+
+
+function cmap = paper_hot_colormap(n)
+% Black-red-yellow map with a muted high end to avoid white saturation.
+    if nargin < 1, n = 256; end
+    x = [0.00 0.20 0.45 0.70 0.90 1.00];
+    c = [0.00 0.00 0.00
+         0.16 0.00 0.00
+         0.75 0.00 0.00
+         1.00 0.28 0.00
+         1.00 0.82 0.00
+         1.00 0.94 0.42];
+    xi = linspace(0, 1, n);
+    cmap = interp1(x, c, xi, 'linear');
+end
+
+function Zs = smooth_heatmap(Z, sigma_y, sigma_x)
+% Small separable Gaussian smoothing for display only.
+    if sigma_y <= 0 && sigma_x <= 0
+        Zs = Z;
         return;
     end
-    clim = prctile(vals, pct);
-    if ~all(isfinite(clim)) || clim(1) >= clim(2)
-        v = max(abs(vals));
-        if ~isfinite(v) || v == 0, v = 1; end
-        clim = [0, v];
+
+    ky = gaussian_kernel_1d(sigma_y);
+    kx = gaussian_kernel_1d(sigma_x);
+    Zs = conv2(Z, ky(:), 'same');
+    Zs = conv2(Zs, kx(:)', 'same');
+end
+
+function k = gaussian_kernel_1d(sigma)
+    if sigma <= 0
+        k = 1;
+        return;
     end
+    radius = max(1, ceil(3 * sigma));
+    x = -radius:radius;
+    k = exp(-(x.^2) / (2 * sigma^2));
+    k = k / sum(k);
+end
+
+function h = pcolormesh_centers(ax, x, y, Z)
+% MATLAB equivalent of matplotlib pcolormesh(x, y, Z, shading='auto')
+% when x and y are cell centers.
+    x = x(:)';
+    y = y(:);
+    if size(Z, 1) ~= numel(y) || size(Z, 2) ~= numel(x)
+        error('pcolormesh_centers: Z must be [numel(y) x numel(x)].');
+    end
+
+    xe = centers_to_edges(x);
+    ye = centers_to_edges(y');
+    [X, Y] = meshgrid(xe, ye);
+
+    C = zeros(numel(y) + 1, numel(x) + 1);
+    C(1:end-1, 1:end-1) = Z;
+    C(end, 1:end-1) = Z(end, :);
+    C(1:end-1, end) = Z(:, end);
+    C(end, end) = Z(end, end);
+
+    h = surface(ax, X, Y, zeros(size(C)), C, ...
+        'EdgeColor', 'none', 'FaceColor', 'flat');
+    view(ax, 2);
+end
+
+function edges = centers_to_edges(centers)
+    centers = centers(:)';
+    if isscalar(centers)
+        step = 0.5;
+        edges = [centers - step, centers + step];
+        return;
+    end
+
+    mid = 0.5 * (centers(1:end-1) + centers(2:end));
+    first = centers(1) - 0.5 * (centers(2) - centers(1));
+    last = centers(end) + 0.5 * (centers(end) - centers(end-1));
+    edges = [first, mid, last];
 end
 
 
 
 
 function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
-% C_L(q,ω), C_T(q,ω)  —  dynasor 방식 (ACF → FFT, per-atom, partial)
+% C_L(q,ω), C_T(q,ω)  —  dynasor 방식 (ACF → Filon, per-atom, partial)
 
     Nt      = size(atoms.vel, 3);
     dt      = cfg.timeStepFs;            % [fs]  — dynasor 단위계 통일
@@ -130,6 +201,9 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     if ~isfield(cfg, 'windowStep'), cfg.windowStep = floor(cfg.windowSize/2); end
     ws    = cfg.windowSize;
     wstep = cfg.windowStep;
+    if mod(ws, 2) ~= 0
+        error('cfg.windowSize must be even to match dynasor fourier_cos_filon.');
+    end
     N_tc  = ws + 1;   % lag τ = 0, 1, ..., ws
 
     q_mag = sqrt(sum(q_cart.^2, 2));
@@ -175,6 +249,9 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     % ── [2] Step 2: 윈도우 기반 ACF 누적 ──────────────────────
     starts    = 1 : wstep : (Nt - ws);
     n_windows = numel(starts);
+    if n_windows == 0
+        error('No windows processed. Nt (%d) must be larger than cfg.windowSize (%d).', Nt, ws);
+    end
     CL_acf    = zeros(num_q, N_tc);
     CT_acf    = zeros(num_q, N_tc);
 
@@ -207,79 +284,71 @@ function [omega_THz, CL, CT] = compute_current_correlate(atoms, q_cart, cfg)
     CL_acf = CL_acf / (n_windows * N_atoms);
     CT_acf = CT_acf / (n_windows * N_atoms);
 
-    % ── Wiener-Khinchin: mirror ACF → FFT → real ───────────────
-    % ACF는 짝함수: mirror [C(0)..C(ws), C(ws-1)..C(1)] → 길이 2ws+1
-    CL_mir = [CL_acf, CL_acf(:, end:-1:2)];   % [Nq × (2ws+1)]
-    CT_mir = [CT_acf, CT_acf(:, end:-1:2)];
-    N_fft  = 2*ws + 1;
-    n_pos  = ws + 1;   % rfft 양수 주파수 수 = floor(N_fft/2)+1
+    % Dynasor uses fourier_cos_filon(C(q,t), dt), not mirrored FFT.
+    [omega_rad_fs, CL_qw] = fourier_cos_filon_matlab(CL_acf, dt);
+    [~,            CT_qw] = fourier_cos_filon_matlab(CT_acf, dt);
 
-    CL_psd = real(fft(CL_mir, [], 2)) * dt;   % [Nq × N_fft]
-    CT_psd = real(fft(CT_mir, [], 2)) * dt;
+    CL = CL_qw';   % [N_freq x Nq]
+    CT = CT_qw';
 
-    CL = CL_psd(:, 1:n_pos)';   % [N_pos × Nq]
-    CT = CT_psd(:, 1:n_pos)';
-
-    omega_THz = (0 : n_pos-1) / (N_fft * dt) * 1e3;    % 선형 주파수 [THz]  (dt [fs] → *1e3)
+    omega_THz = omega_rad_fs(:) / (2*pi) * 1e3;  % rad/fs -> cycles/ps = THz
     fprintf('[CC] Done in %.0fs.\n', toc(t_acf));
 end
 
+function [omega, F] = fourier_cos_filon_matlab(f, dt)
+% MATLAB port of dynasor.post_processing.filon.fourier_cos_filon.
+% f is [Nq x Nt] with Nt = window_size + 1 and window_size even.
+    if ndims(f) ~= 2
+        error('fourier_cos_filon_matlab: f must be a 2D array.');
+    end
 
-<<<<<<< Updated upstream
-=======
-function plot_CC(CL, CT, omega_THz, q_reduced)
-    % omega_THz 는 이미 양수 주파수만 포함 (0 ~ Nyquist)
-    qi      = q_reduced <= 0.5 + 1e-12;
-    q_plt   = 2 * q_reduced(qi);
-    CL_qi   = CL(:, qi);
-    CT_qi   = CT(:, qi);
-    diff_qi = CL_qi - CT_qi;
+    [n_rows, Nt] = size(f);
+    if mod(Nt, 2) == 0 || Nt < 3
+        error('fourier_cos_filon_matlab: f must have an odd number of time samples >= 3.');
+    end
 
-    freq_max  = max(omega_THz);
+    omega = linspace(0, pi / dt, Nt);  % rad/fs, same grid as dynasor
+    time = (0:Nt-1)' * dt;
+    F = zeros(n_rows, Nt);
 
-    % 99th-percentile clipping (linear scale)
-    vmax_L    = prctile(CL_qi(:),       99);
-    vmax_T    = prctile(CT_qi(:),       99);
-    vlim_diff = prctile(abs(diff_qi(:)), 99);
+    block_size = 256;
+    for i0 = 1:block_size:Nt
+        i1 = min(Nt, i0 + block_size - 1);
+        wb = omega(i0:i1);
+        [alpha, beta, gamma] = filon_alpha_beta_gamma(wb * dt);
 
-    % blue-white-red diverging colormap for C_L − C_T
-    n_cmap = 256; half = n_cmap / 2;
-    r = [linspace(0,1,half), ones(1,half)];
-    g = [linspace(0,1,half), linspace(1,0,half)];
-    b = [ones(1,half),       linspace(1,0,half)];
-    cmap_bwr = [r; g; b]';
+        weights = cos(time * wb);
+        weights(1:2:end, :) = weights(1:2:end, :) .* beta;
+        weights(2:2:end-1, :) = weights(2:2:end-1, :) .* gamma;
 
-    figure('Color','w','Position',[100 100 1800 500]);
+        weights(1, :) = 0.5 * weights(1, :) - alpha .* sin(wb * time(1));
+        weights(end, :) = 0.5 * weights(end, :) + alpha .* sin(wb * time(end));
 
-    ax1 = subplot(1,3,1);
-    imagesc(q_plt, omega_THz, CL_qi);
-    set(gca,'YDir','normal'); axis tight; ylim([0 freq_max]);
-    caxis([0 vmax_L]);
-    colormap(ax1, 'turbo'); colorbar;
-    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L (longitudinal)');
-
-    ax2 = subplot(1,3,2);
-    imagesc(q_plt, omega_THz, CT_qi);
-    set(gca,'YDir','normal'); axis tight; ylim([0 freq_max]);
-    caxis([0 vmax_T]);
-    colormap(ax2, 'parula'); colorbar;
-    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_T (transverse)');
-
-    ax3 = subplot(1,3,3);
-    imagesc(q_plt, omega_THz, diff_qi);
-    set(gca,'YDir','normal'); axis tight; ylim([0 freq_max]);
-    caxis([-vlim_diff vlim_diff]);
-    colormap(ax3, cmap_bwr); colorbar;
-    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('C_L − C_T');
-
-    saveName = fullfile(fileparts(mfilename('fullpath')), ...
-        sprintf('CC_%s.png', datestr(now,'yyyymmdd_HHMMSS')));
-    exportgraphics(gcf, saveName, 'Resolution', 200);
-    fprintf('Saved: %s\n', saveName);
+        F(:, i0:i1) = 2 * dt * (f * weights);
+    end
 end
 
+function [alpha, beta, gamma] = filon_alpha_beta_gamma(theta)
+% Vectorized coefficients from dynasor.post_processing.filon._alpha_beta_gamma_single.
+    alpha = zeros(size(theta));
+    beta = zeros(size(theta));
+    gamma = zeros(size(theta));
 
->>>>>>> Stashed changes
+    zero = abs(theta) < eps;
+    alpha(zero) = 0.0;
+    beta(zero) = 2/3;
+    gamma(zero) = 4/3;
+
+    nz = ~zero;
+    th = theta(nz);
+    s = sin(th);
+    c = cos(th);
+
+    alpha(nz) = (th.^2 + th .* s .* c - 2 * s.^2) ./ th.^3;
+    beta(nz) = 2 * (th .* (1 + c.^2) - 2 * s .* c) ./ th.^3;
+    gamma(nz) = 4 * (s - th .* c) ./ th.^3;
+end
+
 % ── 아래는 main.m 과 동일한 헬퍼 함수들 ──────────────────────────
 
 function [atoms, mData, folderPath] = read_trajectory(folderPath, maxSteps)

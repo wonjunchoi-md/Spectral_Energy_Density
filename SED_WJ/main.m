@@ -3,8 +3,8 @@
 % ================================================================
 
 %% ===== Config ===================================================
-cfg.folderPath = 'SED_Align';
-cfg.primFile   = 'SED_Align/prim_no_H.xyz';
+cfg.folderPath = '';
+cfg.primFile   = 'prim_no_H.xyz';
 cfg.timeStepFs = 40;       % dump 간격 [fs]  (dt=0.5fs × dump_every=80)
 cfg.numSplits  = 1;
 cfg.maxSteps   = 0;        % 읽을 최대 프레임 수 (0 = 전체)
@@ -12,8 +12,8 @@ cfg.maxSteps   = 0;        % 읽을 최대 프레임 수 (0 = 전체)
 
 %% ===== Pipeline =================================================
 
-[atoms, mData] = read_trajectory(cfg.folderPath, cfg.maxSteps);
-prim           = read_prim_xyz(cfg.primFile);
+[atoms, mData, folderPath] = read_trajectory(cfg.folderPath, cfg.maxSteps);
+prim           = read_prim_xyz(fullfile(folderPath, cfg.primFile));
 ref            = build_reference(prim, mData, atoms);
 % BvK q-points: n=0..N/2  (총 N/2+1 개, 물리적으로 의미있는 유일한 점들)
 q_reduced      = (0 : floor(ref.N_UC/2)) / ref.N_UC;
@@ -22,12 +22,13 @@ q_cart         = make_q_path(ref, q_reduced);
 plot_SED(SED_x, SED_y, SED_z, freq_THz, q_reduced);
 
 
+
 %% ================================================================
 %  Local Functions
 %% ================================================================
 
 % ── 1. Trajectory reader ─────────────────────────────────────────
-function [atoms, mData] = read_trajectory(folderPath, maxSteps)
+function [atoms, mData, folderPath] = read_trajectory(folderPath, maxSteps)
     if isempty(folderPath)
         folderPath = uigetdir(pwd, 'Select data folder');
         if folderPath == 0, folderPath = pwd; end
@@ -253,13 +254,15 @@ end
 
 % ── 5. SED 계산 ───────────────────────────────────────────────────
 function [freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg)
-% SED(q,ω) = (1/4πT·N) Σ_b m_b |Σ_n exp(iq·R_n) FFT[v_{b,n}(t)]|²
+% Dynasor-style SED: positive FFT bins, mass-weighted velocities,
+% and normalization dt / (N_samples * N_UC * 2*pi).
 
     numSteps        = size(atoms.vel, 3);
-    dt              = cfg.timeStepFs * 1e-15;
+    dt_fs           = cfg.timeStepFs;
     steps_per_split = floor(numSteps / cfg.numSplits);
-    sim_time_ps     = dt * steps_per_split * 1e12;
+    sim_time_ps     = dt_fs * steps_per_split * 1e-3;
     num_q           = size(q_cart, 1);
+    n_freq          = floor(steps_per_split / 2) + 1;
 
     fprintf('[SED] dt=%.1ffs | steps=%d | T=%.1fps | %d q-pts\n', ...
         cfg.timeStepFs, steps_per_split, sim_time_ps, num_q);
@@ -269,16 +272,16 @@ function [freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg)
     basisVals = unique(ref.basis);
     num_basis = numel(basisVals);
 
-    SED_x = zeros(steps_per_split, num_q);
-    SED_y = zeros(steps_per_split, num_q);
-    SED_z = zeros(steps_per_split, num_q);
-    norm  = 4 * pi * sim_time_ps * ref.N_UC;
+    SED_x = zeros(n_freq, num_q);
+    SED_y = zeros(n_freq, num_q);
+    SED_z = zeros(n_freq, num_q);
+    norm_factor = dt_fs / (steps_per_split * ref.N_UC * 2*pi);
     t0    = tic;
 
     for iq = 1:num_q
-        acc_x = zeros(steps_per_split, 1);
-        acc_y = zeros(steps_per_split, 1);
-        acc_z = zeros(steps_per_split, 1);
+        acc_x = zeros(n_freq, 1);
+        acc_y = zeros(n_freq, 1);
+        acc_z = zeros(n_freq, 1);
 
         for ib = 1:num_basis
             idx   = find(ref.basis == ib);
@@ -287,15 +290,17 @@ function [freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg)
             v3    = reshape(vels(idx,:,:), [numel(idx), 3, steps_per_split]);
             % Σ_n  exp(iq·R_n) · v_{b,n}(t)
             v_sum = squeeze(sum(v3 .* ph, 1));    % [3 × steps]
+            v_fft = fft(v_sum, [], 2);
+            v_fft = v_fft(:, 1:n_freq);
 
-            acc_x = acc_x + m_b * abs(fftshift(fft(v_sum(1,:)))').^2;
-            acc_y = acc_y + m_b * abs(fftshift(fft(v_sum(2,:)))').^2;
-            acc_z = acc_z + m_b * abs(fftshift(fft(v_sum(3,:)))').^2;
+            acc_x = acc_x + m_b * abs(v_fft(1,:)).'.^2;
+            acc_y = acc_y + m_b * abs(v_fft(2,:)).'.^2;
+            acc_z = acc_z + m_b * abs(v_fft(3,:)).'.^2;
         end
 
-        SED_x(:,iq) = acc_x / norm;
-        SED_y(:,iq) = acc_y / norm;
-        SED_z(:,iq) = acc_z / norm;
+        SED_x(:,iq) = acc_x * norm_factor;
+        SED_y(:,iq) = acc_y * norm_factor;
+        SED_z(:,iq) = acc_z * norm_factor;
 
         if mod(iq, 20) == 0 || iq == num_q
             elapsed = toc(t0);
@@ -304,41 +309,137 @@ function [freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg)
         end
     end
 
-    freq_THz = linspace(-0.5/dt, 0.5/dt, steps_per_split) / 1e12;
+    freq_THz = (0:n_freq-1)' / (steps_per_split * dt_fs) * 1e3;
     fprintf('[SED] Done in %.0fs.\n', toc(t0));
 end
 
 
 % ── 6. 시각화 ─────────────────────────────────────────────────────
 function plot_SED(SED_x, SED_y, SED_z, freq_THz, q_reduced)
-    fi    = freq_THz >= 0;
     qi    = q_reduced <= 0.5 + 1e-12;
-    freq  = freq_THz(fi);
+    freq  = freq_THz(:);
     q_plt = 2 * q_reduced(qi);
 
-    S = SED_x(fi,qi) + SED_y(fi,qi) + SED_z(fi,qi);
+    S = SED_x(:,qi) + SED_y(:,qi) + SED_z(:,qi);
+    S = prepare_sed_intensity(S);
 
-%     % ── RGB (x→Blue, y→Green, z→Red) — 나중에 활성화 ──
-%     clip = @(M) min(M, prctile(M(M>0), 99));
-%     nx = clip(SED_x(fi,qi)); nx = nx/(max(nx(:))+eps);
-%     ny = clip(SED_y(fi,qi)); ny = ny/(max(ny(:))+eps);
-%     nz = clip(SED_z(fi,qi)); nz = nz/(max(nz(:))+eps);
-%     xCol=[0 0 1]; yCol=[0 1 0]; zCol=[1 0 0]; N=2;
-%     R=1-sqrt(((nx*(1-xCol(1))).^2+(ny*(1-yCol(1))).^2+(nz*(1-zCol(1))).^2)/N);
-%     G=1-sqrt(((nx*(1-xCol(2))).^2+(ny*(1-yCol(2))).^2+(nz*(1-zCol(2))).^2)/N);
-%     B=1-sqrt(((nx*(1-xCol(3))).^2+(ny*(1-yCol(3))).^2+(nz*(1-zCol(3))).^2)/N);
-%     [xg,yg]=meshgrid(1:5,1:5); h=exp(-((xg-3).^2+(yg-3).^2)/2); h=h/sum(h(:));
-%     RGB_s=cat(3,conv2(R,h,'same'),conv2(G,h,'same'),conv2(B,h,'same')).^0.9;
+    vals = S(isfinite(S) & S > 0);
+    if isempty(vals)
+        clim_s = [0 1];
+    else
+        vmax = prctile(vals, 99.7);
+        if ~isfinite(vmax) || vmax <= 0, vmax = max(vals); end
+        if ~isfinite(vmax) || vmax <= 0, vmax = 1; end
+        clim_s = [0 vmax];
+    end
 
-    fig = figure('Color','w','Position',[100 200 900 500]);
-    imagesc(q_plt, freq, log(S + 1e-30));
-    set(gca,'YDir','normal'); axis tight;
-    ylim([0 1]);
-    colormap(hot); colorbar;
-    xlabel('q (π/a)'); ylabel('Frequency (THz)'); title('SED (log intensity)');
+    fig = figure('Color','w','Position',[100 200 820 520]);
+    ax = axes(fig);
+    pcolormesh_centers(ax, q_plt, freq, S);
+    set(ax, 'YDir', 'normal', 'Box', 'on', 'Layer', 'top', ...
+        'FontSize', 12, 'LineWidth', 1.0, 'TickDir', 'in');
+    axis(ax, 'tight');
+    xlim(ax, [min(q_plt) max(q_plt)]);
+    ylim(ax, [0 max(freq)]);
+    xticks(ax, 0:0.2:1);
+    clim(ax, clim_s);
+    colormap(ax, paper_hot_colormap(256));
+    cb = colorbar(ax);
+    cb.Label.String = 'SED';
+    cb.Label.FontSize = 11;
+    xlabel(ax, 'q (\pi/a)');
+    ylabel(ax, 'Frequency (THz)');
+    title(ax, 'SED');
 
     saveName = fullfile(fileparts(mfilename('fullpath')), ...
-        sprintf('SED_%s.png', datestr(now,'yyyymmdd_HHMMSS')));
+        sprintf('SED_%s.png', char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'))));
     exportgraphics(fig, saveName, 'Resolution', 200);
     fprintf('Saved: %s\n', saveName);
+end
+
+function I = prepare_sed_intensity(Z)
+% Plot-only cleanup for paper-style SED visualization.
+    I = max(Z, 0);
+    I(~isfinite(I)) = 0;
+    vals0 = I(isfinite(I) & I > 0);
+    if ~isempty(vals0)
+        I = max(I - prctile(vals0, 25), 0);
+    end
+    I = smooth_heatmap(I, 0.85, 0.50);
+end
+
+function cmap = paper_hot_colormap(n)
+% Black-red-yellow-white map similar to current-correlation paper figures.
+    if nargin < 1, n = 256; end
+    x = [0.00 0.20 0.45 0.70 0.88 1.00];
+    c = [0.00 0.00 0.00
+         0.16 0.00 0.00
+         0.75 0.00 0.00
+         1.00 0.28 0.00
+         1.00 0.90 0.00
+         1.00 1.00 1.00];
+    xi = linspace(0, 1, n);
+    cmap = interp1(x, c, xi, 'linear');
+end
+
+function Zs = smooth_heatmap(Z, sigma_y, sigma_x)
+% Small separable Gaussian smoothing for display only.
+    if sigma_y <= 0 && sigma_x <= 0
+        Zs = Z;
+        return;
+    end
+
+    ky = gaussian_kernel_1d(sigma_y);
+    kx = gaussian_kernel_1d(sigma_x);
+    Zs = conv2(Z, ky(:), 'same');
+    Zs = conv2(Zs, kx(:)', 'same');
+end
+
+function k = gaussian_kernel_1d(sigma)
+    if sigma <= 0
+        k = 1;
+        return;
+    end
+    radius = max(1, ceil(3 * sigma));
+    x = -radius:radius;
+    k = exp(-(x.^2) / (2 * sigma^2));
+    k = k / sum(k);
+end
+
+function h = pcolormesh_centers(ax, x, y, Z)
+% MATLAB equivalent of matplotlib pcolormesh(x, y, Z, shading='auto')
+% when x and y are cell centers.
+    x = x(:)';
+    y = y(:);
+    if size(Z, 1) ~= numel(y) || size(Z, 2) ~= numel(x)
+        error('pcolormesh_centers: Z must be [numel(y) x numel(x)].');
+    end
+
+    xe = centers_to_edges(x);
+    ye = centers_to_edges(y');
+    [X, Y] = meshgrid(xe, ye);
+
+    C = zeros(numel(y) + 1, numel(x) + 1);
+    C(1:end-1, 1:end-1) = Z;
+    C(end, 1:end-1) = Z(end, :);
+    C(1:end-1, end) = Z(:, end);
+    C(end, end) = Z(end, end);
+
+    h = surface(ax, X, Y, zeros(size(C)), C, ...
+        'EdgeColor', 'none', 'FaceColor', 'flat');
+    view(ax, 2);
+end
+
+function edges = centers_to_edges(centers)
+    centers = centers(:)';
+    if isscalar(centers)
+        step = 0.5;
+        edges = [centers - step, centers + step];
+        return;
+    end
+
+    mid = 0.5 * (centers(1:end-1) + centers(2:end));
+    first = centers(1) - 0.5 * (centers(2) - centers(1));
+    last = centers(end) + 0.5 * (centers(end) - centers(end-1));
+    edges = [first, mid, last];
 end
