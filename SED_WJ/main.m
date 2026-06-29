@@ -8,18 +8,21 @@ cfg.primFile   = 'prim_no_H.xyz';
 cfg.timeStepFs = 40;       % dump 간격 [fs]  (dt=0.5fs × dump_every=80)
 cfg.numSplits  = 1;
 cfg.maxSteps   = 0;        % 읽을 최대 프레임 수 (0 = 전체)
-% cfg.qPoints 는 없음 — build_reference 후 N_UC 에서 자동 결정
+% cfg.outputRoot = '';     % 비우면 SED_WJ/SED_outputs/ 자동 생성
 
 %% ===== Pipeline =================================================
 
+cfg            = prepare_output_dir(cfg);
 [atoms, mData, folderPath] = read_trajectory(cfg.folderPath, cfg.maxSteps);
 prim           = read_prim_xyz(fullfile(folderPath, cfg.primFile));
 ref            = build_reference(prim, mData, atoms);
-% BvK q-points: n=0..N/2  (총 N/2+1 개, 물리적으로 의미있는 유일한 점들)
 q_reduced      = (0 : floor(ref.N_UC/2)) / ref.N_UC;
 q_cart         = make_q_path(ref, q_reduced);
-[freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg);
-plot_SED(SED_x, SED_y, SED_z, freq_THz, q_reduced);
+mdata          = compute_SED(atoms, ref, q_cart, cfg);
+mdata.q_reduced = q_reduced;
+save_sed_result(mdata, cfg);
+write_replot_script(cfg.outputDir);
+plot_SED(mdata, cfg);
 
 
 
@@ -176,11 +179,15 @@ end
 
 % ── 3. Reference (ideal lattice positions R_n) ───────────────────
 function ref = build_reference(prim, mData, atoms)
+% Uses Material Studio / LAMMPS x-fastest ordering:
+%   atom i → UC (ix = i_cell % dim_x,
+%                iy = floor(i_cell/dim_x) % dim_y,
+%                iz = floor(i_cell/(dim_x*dim_y)))
+% so that phase factors exp(iq·R_n) are assigned to the correct lattice site.
     numAtoms   = size(atoms.pos, 1);
     typeList   = round(atoms.pos(:,1,1));
     atomsPerUC = prim.n_atoms;
 
-    % prim cell 재스케일: 셀 수가 가장 적은 축에서 prim_a 역산
     L         = [mData.Lx mData.Ly mData.Lz];
     dim_rough = max(1, round(L ./ prim.cell_diag));
     [~, imin] = min(dim_rough);
@@ -191,51 +198,38 @@ function ref = build_reference(prim, mData, atoms)
     ax = mData.Lx/dim_x; ay = mData.Ly/dim_y; az = mData.Lz/dim_z;
 
     switch mData.chainDir
-        case 'x', Nz_chain = dim_x;
-        case 'y', Nz_chain = dim_y;
-        otherwise, Nz_chain = dim_z;
+        case 'x', N_UC_chain = dim_x;
+        case 'y', N_UC_chain = dim_y;
+        otherwise, N_UC_chain = dim_z;
     end
 
     total_UC  = numAtoms / atomsPerUC;
-    numChains = max(1, round(total_UC / Nz_chain));
-    fprintf('[Reference] dim_box=%s | total_UC=%d | Nz=%d | numChains=%d\n', ...
-        mat2str(dim_box), total_UC, Nz_chain, numChains);
+    numChains = max(1, round(total_UC / N_UC_chain));
+    fprintf('[Reference] dim_box=%s | total_UC=%d | N_UC_chain=%d | numChains=%d\n', ...
+        mat2str(dim_box), total_UC, N_UC_chain, numChains);
 
     if isempty(mData.masses)
         error('No masses found. Check .data file or add prim.xyz masses.');
     end
 
-    % 원자별 (chainIdx, ucInChain, basisInUC) 벡터화 계산
-    atomsPerChain = round(numAtoms / numChains);
-    i0            = (0:numAtoms-1)';
-    chainIdx      = floor(i0 / atomsPerChain) + 1;
-    idxInChain    = mod(i0, atomsPerChain);
-    ucInChain     = floor(idxInChain / atomsPerUC) + 1;
-    basisInUC     = mod(idxInChain, atomsPerUC) + 1;
-    basisIndex    = (chainIdx-1)*atomsPerUC + basisInUC;
+    % Material Studio x-fastest ordering: ix fastest, then iy, then iz
+    i0     = (0:numAtoms-1)';
+    i_cell = floor(i0 / atomsPerUC);
+    b_atom = mod(i0, atomsPerUC) + 1;   % 1-based basis index
+
+    ix = mod(i_cell, dim_x);
+    iy = mod(floor(i_cell / dim_x), dim_y);
+    iz = floor(i_cell / (dim_x * dim_y));
+
+    % Ideal unit cell position R_n
+    ref.R_n = [ix*ax, iy*ay, iz*az];   % [nAtoms × 3]
 
     t = min(typeList, numel(mData.masses));
     massList = mData.masses(t)';
 
-    % R_n: 이상 격자 위치 [nAtoms × 3]
-    switch mData.chainDir
-        case 'x', Np=dim_y; da=ay; db=az;
-        case 'y', Np=dim_x; da=ax; db=az;
-        otherwise, Np=dim_x; da=ax; db=ay;
-    end
-    ip = mod(chainIdx-1, Np);
-    jp = floor((chainIdx-1)/Np);
-    iz = ucInChain - 1;
-
-    switch mData.chainDir
-        case 'x', ref.R_n = [iz*ax, ip*da, jp*db];
-        case 'y', ref.R_n = [ip*da, iz*ay, jp*db];
-        otherwise, ref.R_n = [ip*da, jp*db, iz*az];
-    end
-
-    ref.basis    = mod(basisIndex-1, atomsPerUC) + 1;
+    ref.basis    = b_atom;
     ref.masses   = massList;
-    ref.N_UC     = Nz_chain;
+    ref.N_UC     = N_UC_chain;
     ref.ax = ax; ref.ay = ay; ref.az = az;
     ref.chainDir = mData.chainDir;
 end
@@ -252,8 +246,51 @@ function q_cart = make_q_path(ref, q_reduced)
 end
 
 
+% ── Output helpers (CC 시스템과 동일한 패턴) ──────────────────────
+function cfg = prepare_output_dir(cfg)
+    sourceDir = fileparts(mfilename('fullpath'));
+    if isempty(sourceDir), sourceDir = pwd; end
+    cfg.sourceDir = sourceDir;
+
+    if ~isfield(cfg, 'outputRoot') || isempty(cfg.outputRoot)
+        cfg.outputRoot = fullfile(sourceDir, 'SED_outputs');
+    end
+    if ~isfield(cfg, 'runTag') || isempty(cfg.runTag)
+        cfg.runTag = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+    end
+    cfg.outputDir = fullfile(cfg.outputRoot, ['SED_' cfg.runTag]);
+    if ~exist(cfg.outputDir, 'dir'), mkdir(cfg.outputDir); end
+    fprintf('Output folder: %s\n', cfg.outputDir);
+end
+
+function save_sed_result(mdata, cfg)
+    dataFile = fullfile(cfg.outputDir, 'SED_data.mat');
+    mdata.sourceDir = cfg.sourceDir;   % so PLOT.m can addpath back to main.m
+    save(dataFile, 'mdata', '-v7.3');
+    fprintf('Saved data: %s\n', dataFile);
+end
+
+function write_replot_script(outputDir)
+    plotFile = fullfile(outputDir, 'PLOT.m');
+    fid = fopen(plotFile, 'w');
+    if fid < 0, error('Cannot write %s', plotFile); end
+    cleaner = onCleanup(@() fclose(fid));
+    fprintf(fid, '%% Replot saved SED — run this file from its own folder.\n');
+    fprintf(fid, 'clear; close all;\n');
+    fprintf(fid, 'thisDir = fileparts(mfilename(''fullpath''));\n');
+    fprintf(fid, 'S = load(fullfile(thisDir, ''SED_data.mat''));\n');
+    fprintf(fid, 'mdata = S.mdata;\n');
+    fprintf(fid, 'if isfield(mdata, ''sourceDir'') && exist(mdata.sourceDir, ''dir'')\n');
+    fprintf(fid, '    addpath(mdata.sourceDir);\n');
+    fprintf(fid, 'end\n');
+    fprintf(fid, 'cfg.outputDir = thisDir;\n');
+    fprintf(fid, 'plot_SED(mdata, cfg);\n');
+    fprintf('Wrote: %s\n', plotFile);
+end
+
+
 % ── 5. SED 계산 ───────────────────────────────────────────────────
-function [freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg)
+function mdata = compute_SED(atoms, ref, q_cart, cfg)
 % Dynasor-style SED: positive FFT bins, mass-weighted velocities,
 % and normalization dt / (N_samples * N_UC * 2*pi).
 
@@ -288,7 +325,6 @@ function [freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg)
             m_b   = ref.masses(idx(1));
             ph    = phase_fac(idx, iq);           % [nAtoms_b × 1]
             v3    = reshape(vels(idx,:,:), [numel(idx), 3, steps_per_split]);
-            % Σ_n  exp(iq·R_n) · v_{b,n}(t)
             v_sum = squeeze(sum(v3 .* ph, 1));    % [3 × steps]
             v_fft = fft(v_sum, [], 2);
             v_fft = v_fft(:, 1:n_freq);
@@ -309,52 +345,81 @@ function [freq_THz, SED_x, SED_y, SED_z] = compute_SED(atoms, ref, q_cart, cfg)
         end
     end
 
-    freq_THz = (0:n_freq-1)' / (steps_per_split * dt_fs) * 1e3;
+    mdata.SED_x    = SED_x;
+    mdata.SED_y    = SED_y;
+    mdata.SED_z    = SED_z;
+    mdata.freq_THz = (0:n_freq-1)' / (steps_per_split * dt_fs) * 1e3;
     fprintf('[SED] Done in %.0fs.\n', toc(t0));
 end
 
 
 % ── 6. 시각화 ─────────────────────────────────────────────────────
-function plot_SED(SED_x, SED_y, SED_z, freq_THz, q_reduced)
-    qi    = q_reduced <= 0.5 + 1e-12;
-    freq  = freq_THz(:);
-    q_plt = 2 * q_reduced(qi);
-
-    S = SED_x(:,qi) + SED_y(:,qi) + SED_z(:,qi);
-    S = prepare_sed_intensity(S);
-
-    vals = S(isfinite(S) & S > 0);
-    if isempty(vals)
-        clim_s = [0 1];
+function plot_SED(mdata, cfg)
+    if nargin < 2 || ~isstruct(cfg), cfg = struct(); end
+    if ~isfield(cfg, 'outputDir') || isempty(cfg.outputDir)
+        cfg.outputDir = fileparts(mfilename('fullpath'));
+        if isempty(cfg.outputDir), cfg.outputDir = pwd; end
+    end
+    if ~isfield(cfg, 'runTag') || isempty(cfg.runTag)
+        tag = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
     else
-        vmax = prctile(vals, 99.7);
-        if ~isfinite(vmax) || vmax <= 0, vmax = max(vals); end
-        if ~isfinite(vmax) || vmax <= 0, vmax = 1; end
-        clim_s = [0 vmax];
+        tag = cfg.runTag;
     end
 
-    fig = figure('Color','w','Position',[100 200 820 520]);
-    ax = axes(fig);
-    pcolormesh_centers(ax, q_plt, freq, S);
-    set(ax, 'YDir', 'normal', 'Box', 'on', 'Layer', 'top', ...
-        'FontSize', 12, 'LineWidth', 1.0, 'TickDir', 'in');
-    axis(ax, 'tight');
-    xlim(ax, [min(q_plt) max(q_plt)]);
-    ylim(ax, [0 max(freq)]);
-    xticks(ax, 0:0.2:1);
-    clim(ax, clim_s);
-    colormap(ax, paper_hot_colormap(256));
-    cb = colorbar(ax);
-    cb.Label.String = 'SED';
-    cb.Label.FontSize = 11;
-    xlabel(ax, 'q (\pi/a)');
-    ylabel(ax, 'Frequency (THz)');
-    title(ax, 'SED');
+    qi    = mdata.q_reduced <= 0.5 + 1e-12;
+    freq  = mdata.freq_THz(:);
+    q_plt = 2 * mdata.q_reduced(qi);
 
-    saveName = fullfile(fileparts(mfilename('fullpath')), ...
-        sprintf('SED_%s.png', char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'))));
-    exportgraphics(fig, saveName, 'Resolution', 200);
+    Sx = prepare_sed_intensity(mdata.SED_x(:, qi));
+    Sy = prepare_sed_intensity(mdata.SED_y(:, qi));
+    Sz = prepare_sed_intensity(mdata.SED_z(:, qi));
+    St = prepare_sed_intensity(mdata.SED_x(:, qi) + mdata.SED_y(:, qi) + mdata.SED_z(:, qi));
+
+    clim_x = safe_clim(Sx, [0 99]);
+    clim_y = safe_clim(Sy, [0 99]);
+    clim_z = safe_clim(Sz, [0 99]);
+    clim_t = safe_clim(St, [0 99]);
+
+    figure('Color','w','Position',[100 100 1800 500]);
+
+    titles = {'SED_x', 'SED_y', 'SED_z', 'SED total'};
+    datas  = {Sx, Sy, Sz, St};
+    clims  = {clim_x, clim_y, clim_z, clim_t};
+    cmaps  = {'turbo', 'turbo', 'turbo', paper_hot_colormap(256)};
+
+    for k = 1:4
+        ax = subplot(1, 4, k);
+        pcolormesh_centers(ax, q_plt, freq, datas{k});
+        set(ax, 'YDir','normal', 'Box','on', 'Layer','top', ...
+            'FontSize', 11, 'LineWidth', 1.0, 'TickDir','in');
+        axis(ax, 'tight');
+        xlim(ax, [min(q_plt) max(q_plt)]);
+        ylim(ax, [0 2]);
+        xticks(ax, 0:0.2:1);
+        clim(ax, clims{k});
+        colormap(ax, cmaps{k});
+        colorbar(ax);
+        xlabel(ax, 'q (\pi/a)');
+        ylabel(ax, 'Frequency (THz)');
+        title(ax, titles{k});
+    end
+
+    saveName = fullfile(cfg.outputDir, sprintf('SED_%s.png', tag));
+    exportgraphics(gcf, saveName, 'Resolution', 200);
     fprintf('Saved: %s\n', saveName);
+end
+
+
+function clim = safe_clim(Z, pct)
+    vals = Z(:);
+    vals = vals(isfinite(vals) & vals > 0);
+    if isempty(vals), clim = [0 1]; return; end
+    clim = prctile(vals, pct);
+    if ~all(isfinite(clim)) || clim(1) >= clim(2)
+        v = max(abs(vals));
+        if ~isfinite(v) || v == 0, v = 1; end
+        clim = [0 v];
+    end
 end
 
 function I = prepare_sed_intensity(Z)
